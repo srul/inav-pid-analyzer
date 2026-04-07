@@ -73,7 +73,7 @@ function App() {
           )}
 
           {fileInfo && (
-            <>
+            <div>
               <h3>Detected columns</h3>
               <ul>
                 {fileInfo.columns.slice(0, 15).map((col) => (
@@ -81,3 +81,7 @@ function App() {
                 ))}
               </ul>
               <p style={{ color: '#6b7280' }}>
+                (showing first 15 columns)
+              </p>
+            </div>
+          )}
