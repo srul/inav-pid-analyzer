@@ -4,23 +4,36 @@ import './App.css';
 export default function App() {
   const [fileInfo, setFileInfo] = useState(null);
 
+
   function handleFileUpload(e) {
     const file = e.target.files[0];
     if (!file) return;
-
+  
     const reader = new FileReader();
     reader.onload = () => {
       const lines = reader.result.split('\n').filter(Boolean);
-      const columns = lines[0].split(',');
+      const headers = lines[0].split(',');
+  
+      const rows = lines.slice(1).map((line) => {
+        const values = line.split(',');
+        const obj = {};
+        headers.forEach((h, i) => {
+          const v = values[i];
+          obj[h] = isNaN(v) ? v : Number(v);
+        });
+      return obj;
+    });
 
-      setFileInfo({
-        name: file.name,
-        rows: lines.length - 1,
-        columns,
-      });
-    };
-    reader.readAsText(file);
-  }
+    setFileInfo({
+      name: file.name,
+      headers,
+      rows,
+    });
+  };
+
+  reader.readAsText(file);
+}
+
 
   return (
     <div className="app">
