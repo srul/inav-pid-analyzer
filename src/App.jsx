@@ -45,15 +45,15 @@ function App() {
         <section className="upload-card">
           <h2>Upload log file</h2>
           <p>Supported format: Blackbox CSV</p>
-
+      
           <input
             type="file"
             accept=".csv"
             onChange={handleFileUpload}
           />
-
+      
           {error && <p className="error">{error}</p>}
-
+      
           {fileInfo && (
             <div className="file-info">
               <p><strong>File:</strong> {fileInfo.name}</p>
@@ -62,7 +62,7 @@ function App() {
             </div>
           )}
         </section>
-
+      
         <section className="empty-state">
           {!fileInfo && (
             <p>
@@ -71,20 +71,19 @@ function App() {
               Upload a file to start analysis.
             </p>
           )}
-        
+      
           {fileInfo && (
-            <div>
+            <>
               <h3>Detected columns</h3>
-        
               <ul>
-                {fileInfo.columns.slice(0, 15).map((col) => {
-                  return <li key={col}>{col}</li>;
-                })}
+                {fileInfo.columns.slice(0, 15).map((col) => (
+                  <li key={col}>{col}</li>
+                ))}
               </ul>
-        
               <p style={{ color: '#6b7280' }}>
                 (showing first 15 columns)
               </p>
-            </div>
+            </>
           )}
         </section>
+      </main>
