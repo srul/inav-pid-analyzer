@@ -1,13 +1,13 @@
-import { useEffect, useMemo, useState, lazy, Suspense } from "react";
+import { useMemo, useState, lazy, Suspense } from "react";
 import "./App.css";
 
-// Lazy-load Plotly chunk (loads only when chart is shown)
+// Lazy-load Plotly chunk
 const Plot = lazy(() => import("react-plotly.js"));
 
-/** ---------- helpers ---------- **/
+/* ---------------- helpers ---------------- */
 
 function normalizeHeader(h) {
-  return String(h || "").trim();
+  return String(h ?? "").trim();
 }
 
 function lowerHeaders(headers) {
@@ -30,12 +30,11 @@ function pickByIncludes(headers, includesList) {
     const idx = lower.findIndex((h) => h.includes(inc.toLowerCase()));
     if (idx !== -1) picked.push(headers[idx]);
   }
-  // de-dup
   return Array.from(new Set(picked));
 }
 
 function guessColumns(headers) {
-  // Time candidates across tools/exporters
+  // Time candidates
   const time = pickFirst(headers, [
     "time",
     "time_s",
@@ -46,9 +45,8 @@ function guessColumns(headers) {
     "t",
   ]);
 
-  // Gyro candidates vary (examples found in different ecosystems)
-  // We'll try common human-readable and array forms.
-  const gyroCandidates = pickByIncludes(headers, [
+  // Gyro candidates (varies by exporter/tool)
+  const gyro = pickByIncludes(headers, [
     "gyro_roll",
     "gyro_pitch",
     "gyro_yaw",
@@ -61,18 +59,31 @@ function guessColumns(headers) {
     "gyrofilt[0]",
     "gyrofilt[1]",
     "gyrofilt[2]",
-  ]);
+  ]).slice(0, 3);
 
-  // Prefer exactly 3 columns if possible
-  const signals = gyroCandidates.slice(0, 3);
+  // Setpoint candidates (common names)
+  // iNav CSV export names can vary; these patterns cover many exports.
+  const setpoint = pickByIncludes(headers, [
+    "setpoint_roll",
+    "setpoint_pitch",
+    "setpoint_yaw",
+    "setpoint[0]",
+    "setpoint[1]",
+    "setpoint[2]",
+    "rccommand[0]",
+    "rccommand[1]",
+    "rccommand[2]",
+    "rc_command[0]",
+    "rc_command[1]",
+    "rc_command[2]",
+    "rccommandroll",
+    "rccommandpitch",
+    "rccommandyaw",
+  ]).slice(0, 3);
 
-  return { time, signals };
+  return { time, gyro, setpoint };
 }
 
-/**
- * Downsample arrays to at most maxPoints by striding.
- * Keeps first/last points, preserves shape well enough for v0.
- */
 function downsampleXY(x, y, maxPoints = 20000) {
   const n = Math.min(x.length, y.length);
   if (n <= maxPoints) return { x: x.slice(0, n), y: y.slice(0, n) };
@@ -95,16 +106,19 @@ function downsampleXY(x, y, maxPoints = 20000) {
   return { x: xs, y: ys };
 }
 
-/** ---------- component ---------- **/
+/* ---------------- component ---------------- */
 
 export default function App() {
   const [fileInfo, setFileInfo] = useState(null);
   const [error, setError] = useState("");
 
   const [timeCol, setTimeCol] = useState("");
-  const [signalCols, setSignalCols] = useState([]);
+  const [gyroCols, setGyroCols] = useState([]);
+  const [setpointCols, setSetpointCols] = useState([]);
 
-  const [autoDetected, setAutoDetected] = useState({ time: "", signals: [] });
+  const [autoDetected, setAutoDetected] = useState({ time: "", gyro: [], setpoint: [] });
+
+  const [showSetpoint, setShowSetpoint] = useState(true);
   const [maxPoints, setMaxPoints] = useState(20000);
 
   function handleFileUpload(event) {
@@ -115,7 +129,8 @@ export default function App() {
       setError("Please upload a CSV file (Blackbox CSV export).");
       setFileInfo(null);
       setTimeCol("");
-      setSignalCols([]);
+      setGyroCols([]);
+      setSetpointCols([]);
       return;
     }
 
@@ -124,8 +139,9 @@ export default function App() {
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        const text = reader.result;
-        const lines = String(text).split(/\r?\n/).filter((l) => l.trim().length > 0);
+        const text = String(reader.result);
+        const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+
         if (lines.length < 2) {
           setError("CSV file is empty or invalid.");
           setFileInfo(null);
@@ -140,8 +156,8 @@ export default function App() {
           headers.forEach((h, i) => {
             const raw = values[i] ?? "";
             const v = String(raw).trim();
-            const num = Number(v);
-            obj[h] = v === "" ? null : (Number.isFinite(num) ? num : v);
+            const n = Number(v);
+            obj[h] = v === "" ? null : (Number.isFinite(n) ? n : v);
           });
           return obj;
         });
@@ -156,9 +172,14 @@ export default function App() {
 
         setAutoDetected(guessed);
 
-        // Apply auto-detected selections immediately
+        // Apply auto selections
         setTimeCol(guessed.time || "");
-        setSignalCols(guessed.signals || []);
+        setGyroCols(guessed.gyro || []);
+        setSetpointCols(guessed.setpoint || []);
+
+        // Enable overlay automatically only if we detected setpoint cols
+        setShowSetpoint((guessed.setpoint || []).length > 0);
+
       } catch (e) {
         setError("Failed to parse CSV. Please export again from Blackbox Explorer.");
         setFileInfo(null);
@@ -168,54 +189,76 @@ export default function App() {
     reader.readAsText(file);
   }
 
-  // If user clears selectors, let them restore auto-detected quickly
   function applyAutoDetected() {
     setTimeCol(autoDetected.time || "");
-    setSignalCols(autoDetected.signals || []);
+    setGyroCols(autoDetected.gyro || []);
+    setSetpointCols(autoDetected.setpoint || []);
+    setShowSetpoint((autoDetected.setpoint || []).length > 0);
   }
 
-  // Build plot traces (memoized for performance)
+  const canPlot = !!fileInfo && !!timeCol && gyroCols.length > 0;
+
+  // Build plot traces
   const plotData = useMemo(() => {
-    if (!fileInfo || !timeCol || signalCols.length === 0) return [];
+    if (!canPlot) return [];
 
-    const xRaw = fileInfo.rows.map((r) => r[timeCol]).filter((v) => v !== null && v !== undefined);
+    // build time vector once
+    const xAll = fileInfo.rows.map((r) => r[timeCol]);
+    // keep only finite numbers or strings that are not null
+    // (Plotly can handle numeric time or integer loop counters)
+    const x = xAll.map((v) => v).filter((v) => v !== null && v !== undefined);
 
-    // If time column is microseconds, it may be very large; we don’t force convert,
-    // but we keep whatever the user selected.
-    return signalCols.map((col) => {
-      const yRaw = fileInfo.rows.map((r) => r[col]);
+    const traces = [];
 
-      // Align lengths conservatively
-      const n = Math.min(xRaw.length, yRaw.length);
-      const x = xRaw.slice(0, n);
-      const y = yRaw.slice(0, n);
+    // Gyro traces (solid)
+    gyroCols.forEach((col) => {
+      const yAll = fileInfo.rows.map((r) => r[col]);
+      const n = Math.min(x.length, yAll.length);
+      const ds = downsampleXY(x.slice(0, n), yAll.slice(0, n), maxPoints);
 
-      const ds = downsampleXY(x, y, maxPoints);
-
-      return {
+      traces.push({
         x: ds.x,
         y: ds.y,
         type: "scatter",
         mode: "lines",
-        name: col,
-      };
+        name: `Gyro: ${col}`,
+        line: { width: 2 },
+      });
     });
-  }, [fileInfo, timeCol, signalCols, maxPoints]);
 
-  const canPlot = !!fileInfo && !!timeCol && signalCols.length > 0;
+    // Setpoint traces (dashed)
+    if (showSetpoint && setpointCols.length > 0) {
+      setpointCols.forEach((col) => {
+        const yAll = fileInfo.rows.map((r) => r[col]);
+        const n = Math.min(x.length, yAll.length);
+        const ds = downsampleXY(x.slice(0, n), yAll.slice(0, n), maxPoints);
+
+        traces.push({
+          x: ds.x,
+          y: ds.y,
+          type: "scatter",
+          mode: "lines",
+          name: `Setpoint: ${col}`,
+          line: { width: 2, dash: "dash" },
+        });
+      });
+    }
+
+    return traces;
+  }, [fileInfo, timeCol, gyroCols, setpointCols, showSetpoint, maxPoints, canPlot]);
 
   return (
     <div className="app">
       <header className="header">
         <h1>iNav PID Analyzer</h1>
-        <p>Upload an iNav Blackbox CSV and visualize Roll / Pitch / Yaw signals</p>
+        <p>Overlay Gyro vs Setpoint from iNav Blackbox CSV</p>
       </header>
 
       <main className="main">
         {/* Upload */}
         <section className="upload-card">
           <h2>Upload log file</h2>
-          <p style={{ marginTop: 0, color: "#6b7280" }}>Supported format: Blackbox CSV export</p>
+          <p style={{ marginTop: 0, color: "#6b7280" }}>Supported: Blackbox CSV export</p>
 
           <input type="file" accept=".csv" onChange={handleFileUpload} />
 
@@ -225,12 +268,8 @@ export default function App() {
 
           {fileInfo && (
             <div style={{ marginTop: 12 }}>
-              <p>
-                <strong>File:</strong> {fileInfo.name}
-              </p>
-              <p>
-                <strong>Rows:</strong> {fileInfo.rows.length}
-              </p>
+              <p><strong>File:</strong> {fileInfo.name}</p>
+              <p><strong>Rows:</strong> {fileInfo.rows.length}</p>
 
               <div style={{ marginTop: 12 }}>
                 <button type="button" onClick={applyAutoDetected}>
@@ -240,7 +279,8 @@ export default function App() {
 
               <div style={{ marginTop: 12, fontSize: 13, color: "#6b7280" }}>
                 <div><strong>Auto Time:</strong> {autoDetected.time || "(not found)"}</div>
-                <div><strong>Auto Signals:</strong> {autoDetected.signals?.length ? autoDetected.signals.join(", ") : "(not found)"}</div>
+                <div><strong>Auto Gyro:</strong> {autoDetected.gyro?.length ? autoDetected.gyro.join(", ") : "(not found)"}</div>
+                <div><strong>Auto Setpoint:</strong> {autoDetected.setpoint?.length ? autoDetected.setpoint.join(", ") : "(not found)"}</div>
               </div>
 
               <div style={{ marginTop: 12 }}>
@@ -257,6 +297,17 @@ export default function App() {
                   (Downsampling keeps the UI responsive for large logs.)
                 </div>
               </div>
+
+              <div style={{ marginTop: 12 }}>
+                <label style={{ fontSize: 13 }}>
+                  <input
+                    type="checkbox"
+                    checked={showSetpoint}
+                    onChange={(e) => setShowSetpoint(e.target.checked)}
+                  />
+                  &nbsp;Show Setpoint overlay (dashed)
+                </label>
+              </div>
             </div>
           )}
         </section>
@@ -267,18 +318,16 @@ export default function App() {
 
           {fileInfo && (
             <div style={{ width: "100%" }}>
-              <h3>Signal selection</h3>
+              <h3>Column selection</h3>
 
-              {/* Time selector */}
+              {/* Time */}
               <div style={{ marginBottom: 12 }}>
                 <label>
                   Time:&nbsp;
                   <select value={timeCol} onChange={(e) => setTimeCol(e.target.value)}>
                     <option value="">-- select --</option>
                     {fileInfo.headers.map((h) => (
-                      <option key={h} value={h}>
-                        {h}
-                      </option>
+                      <option key={h} value={h}>{h}</option>
                     ))}
                   </select>
                 </label>
@@ -289,29 +338,46 @@ export default function App() {
                 )}
               </div>
 
-              {/* Signal selector */}
-              <div style={{ marginBottom: 20 }}>
+              {/* Gyro */}
+              <div style={{ marginBottom: 12 }}>
                 <label>
-                  Signals (Roll / Pitch / Yaw):<br />
+                  Gyro (solid):<br />
                   <select
                     multiple
-                    style={{ width: "100%", height: 150 }}
-                    value={signalCols}
-                    onChange={(e) =>
-                      setSignalCols(Array.from(e.target.selectedOptions).map((o) => o.value))
-                    }
+                    style={{ width: "100%", height: 110 }}
+                    value={gyroCols}
+                    onChange={(e) => setGyroCols(Array.from(e.target.selectedOptions).map((o) => o.value))}
                   >
                     {fileInfo.headers.map((h) => (
-                      <option key={h} value={h}>
-                        {h}
-                      </option>
+                      <option key={h} value={h}>{h}</option>
                     ))}
                   </select>
                 </label>
-
-                {signalCols.length === 0 && (
+                {gyroCols.length === 0 && (
                   <div style={{ fontSize: 12, color: "#b45309", marginTop: 6 }}>
-                    Couldn’t auto-detect gyro columns — please select manually.
+                    Select at least one gyro column.
+                  </div>
+                )}
+              </div>
+
+              {/* Setpoint */}
+              <div style={{ marginBottom: 20 }}>
+                <label>
+                  Setpoint (dashed):<br />
+                  <select
+                    multiple
+                    style={{ width: "100%", height: 110 }}
+                    value={setpointCols}
+                    onChange={(e) => setSetpointCols(Array.from(e.target.selectedOptions).map((o) => o.value))}
+                  >
+                    {fileInfo.headers.map((h) => (
+                      <option key={h} value={h}>{h}</option>
+                    ))}
+                  </select>
+                </label>
+                {showSetpoint && setpointCols.length === 0 && (
+                  <div style={{ fontSize: 12, color: "#b45309", marginTop: 6 }}>
+                    Overlay is ON but no setpoint columns selected.
                   </div>
                 )}
               </div>
@@ -322,7 +388,7 @@ export default function App() {
                   <Plot
                     data={plotData}
                     layout={{
-                      title: "iNav Signal Plot",
+                      title: "Gyro vs Setpoint Overlay",
                       xaxis: { title: timeCol },
                       yaxis: { title: "Value" },
                       legend: { orientation: "h" },
@@ -336,7 +402,7 @@ export default function App() {
 
               {!canPlot && (
                 <div style={{ fontSize: 13, color: "#6b7280" }}>
-                  Select a time column and at least one signal to display the plot.
+                  Select a time column and at least one gyro signal to display the plot.
                 </div>
               )}
             </div>
