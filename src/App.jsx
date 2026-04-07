@@ -1,8 +1,11 @@
 import { useState } from 'react';
 import './App.css';
+import Plot from 'react-plotly.js';
 
 export default function App() {
   const [fileInfo, setFileInfo] = useState(null);
+  const [timeCol, setTimeCol] = useState('');
+  const [signalCols, setSignalCols] = useState([]);
 
 
   function handleFileUpload(e) {
@@ -55,6 +58,59 @@ export default function App() {
           </ul>
         </div>
       )}
+      
+{fileInfo && (
+  <div style={{ marginTop: 20 }}>
+    <h3>Signal selection</h3>
+
+    <label>
+      Time:
+      <select value={timeCol} onChange={(e) => setTimeCol(e.target.value)}>
+        <option value="">-- select --</option>
+        {fileInfo.headers.map((h) => (
+          <option key={h} value={h}>{h}</option>
+        ))}
+      </select>
+    </label>
+
+    <br /><br />
+
+    <label>
+      Signals (Roll / Pitch / Yaw):
+      <select
+        multiple
+        value={signalCols}
+        onChange={(e) =>
+          setSignalCols([...e.target.selectedOptions].map(o => o.value))
+        }
+        style={{ height: 120 }}
+      >
+        {fileInfo.headers.map((h) => (
+          <option key={h} value={h}>{h}</option>
+        ))}
+      </select>
+    </label>
+  </div>
+)}
+{fileInfo && timeCol && signalCols.length > 0 && (
+  <Plot
+    data={signalCols.map((col) => ({
+      x: fileInfo.rows.map(r => r[timeCol]),
+      y: fileInfo.rows.map(r => r[col]),
+      type: 'scatter',
+      mode: 'lines',
+      name: col,
+    }))}
+    layout={{
+      title: 'iNav Signal Plot',
+      xaxis: { title: timeCol },
+      yaxis: { title: 'Value' },
+      legend: { orientation: 'h' },
+      margin: { t: 40 },
+    }}
+    style={{ width: '100%', height: '500px' }}
+  />
+)}
     </div>
   );
 }
