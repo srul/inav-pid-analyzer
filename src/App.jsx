@@ -72,3 +72,5 @@ function App() {
               <ul>
                 {fileInfo.columns.slice(0, 15).map((col) => (
                   <li key={col}>{col}</li>
+                ))}
+              </ul>
