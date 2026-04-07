@@ -1,1 +1,73 @@
+* {
+  box-sizing: border-box;
+}
 
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: #f5f7fa;
+  color: #1f2933;
+}
+
+.app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.header {
+  padding: 24px;
+  background: white;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.header h1 {
+  margin: 0;
+}
+
+.header p {
+  margin-top: 6px;
+  color: #6b7280;
+}
+
+.main {
+  flex: 1;
+  padding: 24px;
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: 24px;
+}
+
+.upload-card {
+  background: white;
+  padding: 20px;
+  border-radius: 8px;
+  border: 1px solid #e5e7eb;
+}
+
+.upload-card h2 {
+  margin-top: 0;
+}
+
+.upload-card input {
+  margin-top: 12px;
+  width: 100%;
+}
+
+.empty-state {
+  background: #fafafa;
+  border: 2px dashed #d1d5db;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #6b7280;
+  font-size: 16px;
+  text-align: center;
+}
+
+.footer {
+  padding: 12px 24px;
+  font-size: 13px;
+  color: #9ca3af;
+}
