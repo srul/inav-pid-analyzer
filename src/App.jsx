@@ -1,8 +1,7 @@
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 
 /* ================= CONFIG ================= */
 const AXES = ["roll", "pitch", "yaw"];
-const SEVERITY_ORDER = { OK: 0, WARNING: 1, CRITICAL: 2 };
 const PRESET_KEY = "pid-analyzer-presets";
 const THEME_KEY = "pid-analyzer-theme";
 
@@ -27,19 +26,7 @@ function savePresets(presets) {
   localStorage.setItem(PRESET_KEY, JSON.stringify(presets));
 }
 
-/* ================= URL (Shareable Reports) ================= */
-function encodeReport(report) {
-  return btoa(encodeURIComponent(JSON.stringify(report)));
-}
-function decodeReport(hash) {
-  try {
-    return JSON.parse(decodeURIComponent(atob(hash)));
-  } catch {
-    return null;
-  }
-}
-
-/* ================= CSV PARSER ================= */
+/* ================= CSV ================= */
 function parseCSV(file, onSuccess, onError) {
   const r = new FileReader();
   r.onload = () => {
@@ -76,8 +63,8 @@ function parseCSV(file, onSuccess, onError) {
 
 /* ================= ANALYSIS ================= */
 function analyze(data) {
-  const axes = {};
   let global = "OK";
+  const axes = {};
 
   AXES.forEach(a => {
     const g = data.map(r => r[a].gyro);
@@ -85,7 +72,7 @@ function analyze(data) {
     const fs = s.at(-1);
 
     if (Math.abs(fs) < 1e-6) {
-      axes[a] = { severity: "OK", note: "Inactive" };
+      axes[a] = { severity: "OK" };
       return;
     }
 
@@ -96,13 +83,11 @@ function analyze(data) {
     if (overshoot > 15) severity = "WARNING";
     if (overshoot > 30) severity = "CRITICAL";
 
-    if (SEVERITY_ORDER[severity] > SEVERITY_ORDER[global])
-      global = severity;
+    if (severity === "CRITICAL") global = "CRITICAL";
+    else if (severity === "WARNING" && global !== "CRITICAL")
+      global = "WARNING";
 
-    axes[a] = {
-      severity,
-      overshoot: overshoot.toFixed(1),
-    };
+    axes[a] = { severity, overshoot: overshoot.toFixed(1) };
   });
 
   return {
@@ -114,104 +99,96 @@ function analyze(data) {
 
 /* ================= APP ================= */
 export default function App() {
+  const [data, setData] = useState(null);
   const [report, setReport] = useState(null);
-  const [presets, setPresets] = useState(loadPresets());
-  const [presetName, setPresetName] = useState("");
+  const [axis, setAxis] = useState("roll");
+  const [view, setView] = useState("analyzer"); // ✅ Option A
   const [theme, setTheme] = useState(getInitialTheme());
-  const [printMode, setPrintMode] = useState(false);
   const [error, setError] = useState("");
 
-  /* Apply theme */
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
     localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
 
-  /* Restore from URL */
-  useEffect(() => {
-    if (window.location.hash.length > 1) {
-      const r = decodeReport(window.location.hash.slice(1));
-      if (r) setReport(r);
-    }
-  }, []);
-
-  /* Update URL on change */
-  useEffect(() => {
-    if (report) {
-      window.location.hash = encodeReport(report);
-    }
-  }, [report]);
-
-  function savePreset() {
-    if (!presetName || !report) return;
-    const next = [...presets, { id: Date.now(), name: presetName, report }];
-    setPresets(next);
-    savePresets(next);
-    setPresetName("");
-  }
-
-  function loadPreset(p) {
-    setReport(p.report);
-  }
-
-  function deletePreset(id) {
-    const next = presets.filter(p => p.id !== id);
-    setPresets(next);
-    savePresets(next);
-  }
-
-  function enterPrint() {
-    setPrintMode(true);
-    document.documentElement.setAttribute("data-theme", "light");
-    setTimeout(() => window.print(), 50);
-  }
-
-  function exitPrint() {
-    setPrintMode(false);
-    document.documentElement.setAttribute("data-theme", theme);
-  }
-
   return (
-    <div style={{ padding: 20, maxWidth: 900, margin: "auto" }}>
+    <div className={`app ${view}`}>
       <style>{`
-        :root {
-          --bg: #ffffff;
-          --fg: #111827;
-          --card: #f3f4f6;
-          --border: #d1d5db;
-        }
-        [data-theme="dark"] {
-          --bg: #020617;
-          --fg: #e5e7eb;
-          --card: #020617;
-          --border: #334155;
-        }
         body {
-          background: var(--bg);
-          color: var(--fg);
+          margin: 0;
+          font-family: Inter, system-ui, sans-serif;
         }
-        table {
-          border-collapse: collapse;
-          width: 100%;
+
+        .app.analyzer {
+          min-height: 100vh;
+          background: radial-gradient(circle at top, #0b1220, #020617);
+          color: #e5e7eb;
+          padding: 24px;
         }
-        th, td {
-          border: 1px solid var(--border);
-          padding: 6px;
+
+        .top-bar {
+          font-size: 28px;
+          font-weight: 600;
+          color: #ef4444;
+          border-bottom: 2px solid #ef4444;
+          margin-bottom: 16px;
         }
-        @media print {
-          button, input { display: none !important; }
+
+        .axis-tabs {
+          display: flex;
+          gap: 8px;
+          margin: 16px 0;
+        }
+
+        .axis-tabs button {
+          flex: 1;
+          padding: 10px;
+          background: #020617;
+          border: 1px solid #334155;
+          color: #e5e7eb;
+          border-radius: 6px;
+        }
+
+        .axis-tabs button.active {
+          background: #334155;
+        }
+
+        .card {
+          background: #020617;
+          border-left: 6px solid;
+          padding: 16px;
+          margin-bottom: 16px;
+          border-radius: 6px;
+        }
+
+        .card.CRITICAL { border-color: #ef4444; }
+        .card.WARNING  { border-color: #f59e0b; }
+
+        .card-title {
+          font-weight: 600;
+          margin-bottom: 6px;
+        }
+
+        .param {
+          display: flex;
+          justify-content: space-between;
+          font-family: monospace;
+          font-size: 13px;
+          opacity: 0.9;
         }
       `}</style>
 
-      <h1>PID Analyzer (Final)</h1>
+      {/* VIEW TOGGLE */}
+      <div style={{ marginBottom: 12 }}>
+        <button onClick={() => setView("analyzer")}>Analyzer View</button>
+        <button onClick={() => setView("report")} style={{ marginLeft: 8 }}>
+          Report View
+        </button>
+      </div>
 
-      {!printMode && (
+      {view === "analyzer" && (
         <>
-          <button onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
-            {theme === "dark" ? "☀️ Light Mode" : "🌙 Dark Mode"}
-          </button>
-
-          <br /><br />
+          <div className="top-bar">Tune Needs Attention</div>
 
           <input
             type="file"
@@ -219,93 +196,67 @@ export default function App() {
             onChange={e =>
               parseCSV(
                 e.target.files[0],
-                d => setReport(analyze(d)),
+                d => {
+                  setData(d);
+                  setReport(analyze(d));
+                },
                 setError
               )
             }
           />
-        </>
-      )}
 
-      {error && <div style={{ color: "red" }}>{error}</div>}
+          {error && <div style={{ color: "red" }}>{error}</div>}
 
-      {report && (
-        <>
-          <p><b>Generated:</b> {new Date(report.generatedAt).toLocaleString()}</p>
-
-          <h2>
-            Global Status:{" "}
-            <span style={{
-              color:
-                report.global === "CRITICAL"
-                  ? "red"
-                  : report.global === "WARNING"
-                  ? "orange"
-                  : "green"
-            }}>
-              {report.global}
-            </span>
-          </h2>
-
-          <table>
-            <thead>
-              <tr>
-                <th>Axis</th>
-                <th>Severity</th>
-                <th>Overshoot (%)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {AXES.map(a => (
-                <tr key={a}>
-                  <td>{a}</td>
-                  <td>{report.axes[a].severity}</td>
-                  <td>{report.axes[a].overshoot ?? "—"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-
-          {!printMode && (
+          {report && (
             <>
-              <br />
-              <input
-                placeholder="Preset name"
-                value={presetName}
-                onChange={e => setPresetName(e.target.value)}
-              />
-              <button onClick={savePreset}>Save Preset</button>
-              <button onClick={enterPrint} style={{ marginLeft: 8 }}>
-                Print / Save PDF
-              </button>
+              <div className="axis-tabs">
+                {AXES.map(a => (
+                  <button
+                    key={a}
+                    className={axis === a ? "active" : ""}
+                    onClick={() => setAxis(a)}
+                  >
+                    {a.toUpperCase()}
+                  </button>
+                ))}
+              </div>
 
-              {presets.length > 0 && (
-                <>
-                  <h3>Saved Presets</h3>
-                  <ul>
-                    {presets.map(p => (
-                      <li key={p.id}>
-                        <b>{p.name}</b>{" "}
-                        <button onClick={() => loadPreset(p)}>Load</button>
-                        <button onClick={() => deletePreset(p.id)}>Delete</button>
-                      </li>
-                    ))}
-                  </ul>
-                </>
+              {report.axes[axis].severity === "CRITICAL" && (
+                <div className="card CRITICAL">
+                  <div className="card-title">CRITICAL</div>
+                  Enable Harmonic Notch Filter
+                  <div className="param">
+                    <span>gyro_notch1_hz</span>
+                    <span>120 Hz</span>
+                  </div>
+                  <div className="param">
+                    <span>gyro_notch1_cutoff</span>
+                    <span>60 Hz</span>
+                  </div>
+                </div>
               )}
 
-              <p>
-                🔗 This report is encoded in the URL — copy the link to share it.
-              </p>
+              {report.axes[axis].severity !== "OK" && (
+                <div className="card WARNING">
+                  <div className="card-title">WARNING</div>
+                  High Overshoot
+                  <div className="param">
+                    <span>{axis}_p</span>
+                    <span>Reduce 5–10%</span>
+                  </div>
+                </div>
+              )}
             </>
           )}
         </>
       )}
 
-      {printMode && (
-        <button onClick={exitPrint}>Exit Print Mode</button>
+      {view === "report" && (
+        <div style={{ padding: 24 }}>
+          <h2>Report View</h2>
+          {report && <pre>{JSON.stringify(report, null, 2)}</pre>}
+        </div>
       )}
     </div>
   );
 }
-``
