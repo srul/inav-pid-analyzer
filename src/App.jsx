@@ -1,15 +1,15 @@
 import { useState } from "react";
 
 const AXES = [
-  { key: "roll", label: "Roll", gyro: "gyro[0]", set: "setpoint[0]" },
-  { key: "pitch", label: "Pitch", gyro: "gyro[1]", set: "setpoint[1]" },
-  { key: "yaw", label: "Yaw", gyro: "gyro[2]", set: "setpoint[2]" },
+  { key: "roll", label: "Roll" },
+  { key: "pitch", label: "Pitch" },
+  { key: "yaw", label: "Yaw" },
 ];
 
 export default function App() {
   const [info, setInfo] = useState(null);
   const [rows, setRows] = useState([]);
-  const [axis, setAxis] = useState(AXES[0]);
+  const [axisKey, setAxisKey] = useState("roll");
   const [error, setError] = useState("");
 
   function loadFile(e) {
@@ -27,7 +27,6 @@ export default function App() {
         const lines = text.split(/\r?\n/).filter(l => l.trim().length);
         if (lines.length === 0) throw new Error("File is empty");
 
-        // Detect delimiter
         let delimiter = ",";
         if (lines[0].includes("\t")) delimiter = "\t";
         else if (lines[0].includes(";")) delimiter = ";";
@@ -35,14 +34,12 @@ export default function App() {
         const headers = lines[0].split(delimiter).map(h => h.trim());
 
         const timeIdx = headers.indexOf("time");
-
-        const gyroIdx = {
+        const gIdx = {
           roll: headers.indexOf("gyro[0]"),
           pitch: headers.indexOf("gyro[1]"),
           yaw: headers.indexOf("gyro[2]"),
         };
-
-        const setIdx = {
+        const sIdx = {
           roll: headers.indexOf("setpoint[0]"),
           pitch: headers.indexOf("setpoint[1]"),
           yaw: headers.indexOf("setpoint[2]"),
@@ -50,53 +47,23 @@ export default function App() {
 
         if (
           timeIdx === -1 ||
-          gyroIdx.roll === -1 ||
-          gyroIdx.pitch === -1 ||
-          gyroIdx.yaw === -1 ||
-          setIdx.roll === -1 ||
-          setIdx.pitch === -1 ||
-          setIdx.yaw === -1
+          Object.values(gIdx).some(v => v === -1) ||
+          Object.values(sIdx).some(v => v === -1)
         ) {
-          throw new Error(
-            `Missing required columns.
-Found headers: ${headers.join(", ")}`
-          );
+          throw new Error(`Missing required columns`);
         }
 
-        const parsed = lines.slice(1)
-          .map(line => {
-            const parts = line.split(delimiter);
-            return {
-              time: Number(parts[timeIdx]),
-              roll: {
-                gyro: Number(parts[gyroIdx.roll]),
-                set: Number(parts[setIdx.roll]),
-              },
-              pitch: {
-                gyro: Number(parts[gyroIdx.pitch]),
-                set: Number(parts[setIdx.pitch]),
-              },
-              yaw: {
-                gyro: Number(parts[gyroIdx.yaw]),
-                set: Number(parts[setIdx.yaw]),
-              },
-            };
-          })
-          .filter(r =>
-            Number.isFinite(r.time) &&
-            Number.isFinite(r.roll.gyro) &&
-            Number.isFinite(r.roll.set)
-          );
+        const parsed = lines.slice(1).map(line => {
+          const p = line.split(delimiter);
+          return {
+            time: Number(p[timeIdx]),
+            roll: { gyro: Number(p[gIdx.roll]), set: Number(p[sIdx.roll]) },
+            pitch: { gyro: Number(p[gIdx.pitch]), set: Number(p[sIdx.pitch]) },
+            yaw: { gyro: Number(p[gIdx.yaw]), set: Number(p[sIdx.yaw]) },
+          };
+        }).filter(r => Number.isFinite(r.time));
 
-        if (parsed.length === 0) {
-          throw new Error("No numeric data rows found");
-        }
-
-        setInfo({
-          name: file.name,
-          rows: parsed.length,
-        });
-
+        setInfo({ name: file.name, rows: parsed.length });
         setRows(parsed);
       } catch (err) {
         setError(err.message);
@@ -106,30 +73,74 @@ Found headers: ${headers.join(", ")}`
     reader.readAsText(file);
   }
 
-  function makePath(data, key, w, h, pad, minY, maxY) {
+  // ===== METRICS =====
+
+  function computeMetrics(data, axis) {
+    if (!data.length) return null;
+
+    const gyro = data.map(r => r[axis].gyro);
+    const setp = data.map(r => r[axis].set);
+    const time = data.map(r => r.time);
+
+    const finalSet = setp[setp.length - 1];
+    if (finalSet === 0) return null;
+
+    // Overshoot
+    const peak = Math.max(...gyro);
+    const overshootPct = ((peak - finalSet) / Math.abs(finalSet)) * 100;
+
+    // Steady‑state error (last 10%)
+    const tailStart = Math.floor(gyro.length * 0.9);
+    const sse =
+      gyro.slice(tailStart)
+        .map((g, i) => g - setp[tailStart + i])
+        .reduce((a, b) => a + b, 0) /
+      (gyro.length - tailStart);
+
+    // Settling time (±5%)
+    const band = Math.abs(finalSet) * 0.05;
+    let settlingTime = null;
+    for (let i = 0; i < gyro.length; i++) {
+      const within = Math.abs(gyro[i] - finalSet) <= band;
+      if (
+        within &&
+        gyro.slice(i).every(g => Math.abs(g - finalSet) <= band)
+      ) {
+        settlingTime = time[i];
+        break;
+      }
+    }
+
+    return {
+      overshootPct,
+      sse,
+      settlingTime,
+    };
+  }
+
+  function makePath(data, axis, key, w, h, pad, minY, maxY) {
     const minX = data[0].time;
     const maxX = data[data.length - 1].time;
 
-    return data
-      .map((d, i) => {
-        const x =
-          pad + ((d.time - minX) / (maxX - minX)) * (w - 2 * pad);
-        const y =
-          h - pad - ((d[key] - minY) / (maxY - minY)) * (h - 2 * pad);
-        return `${i === 0 ? "M" : "L"} ${x} ${y}`;
-      })
-      .join(" ");
+    return data.map((d, i) => {
+      const x =
+        pad + ((d.time - minX) / (maxX - minX)) * (w - 2 * pad);
+      const y =
+        h - pad -
+        ((d[axis][key] - minY) / (maxY - minY)) * (h - 2 * pad);
+      return `${i === 0 ? "M" : "L"} ${x} ${y}`;
+    }).join(" ");
   }
+
+  const metrics = computeMetrics(rows, axisKey);
 
   return (
     <div style={{ padding: 20 }}>
-      <h1>PID Analyzer — Step 5 (Axis Selector)</h1>
+      <h1>PID Analyzer — Step 6 (Basic Metrics)</h1>
 
       <input type="file" accept=".csv,.txt" onChange={loadFile} />
 
-      {error && (
-        <div style={{ color: "red", marginTop: 10 }}>❌ {error}</div>
-      )}
+      {error && <div style={{ color: "red", marginTop: 10 }}>❌ {error}</div>}
 
       {info && (
         <div style={{ marginTop: 10 }}>
@@ -145,13 +156,10 @@ Found headers: ${headers.join(", ")}`
             {AXES.map(a => (
               <button
                 key={a.key}
-                onClick={() => setAxis(a)}
+                onClick={() => setAxisKey(a.key)}
                 style={{
                   marginRight: 6,
-                  padding: "4px 10px",
-                  border: "1px solid #ccc",
-                  background:
-                    a.key === axis.key ? "#ddd" : "#fff",
+                  background: axisKey === a.key ? "#ddd" : "#fff",
                 }}
               >
                 {a.label}
@@ -159,16 +167,28 @@ Found headers: ${headers.join(", ")}`
             ))}
           </div>
 
+          {metrics && (
+            <div style={{ marginTop: 15 }}>
+              <h3>Metrics</h3>
+              <ul>
+                <li><b>Overshoot:</b> {metrics.overshootPct.toFixed(2)} %</li>
+                <li><b>Steady‑State Error:</b> {metrics.sse.toFixed(3)}</li>
+                <li>
+                  <b>Settling Time:</b>{" "}
+                  {metrics.settlingTime !== null
+                    ? `${metrics.settlingTime.toFixed(3)} s`
+                    : "Not settled"}
+                </li>
+              </ul>
+            </div>
+          )}
+
           {(() => {
-            const w = 800;
-            const h = 300;
-            const pad = 30;
-
+            const w = 800, h = 300, pad = 30;
             const ys = rows.flatMap(r => [
-              r[axis.key].gyro,
-              r[axis.key].set,
+              r[axisKey].gyro,
+              r[axisKey].set,
             ]);
-
             const minY = Math.min(...ys);
             const maxY = Math.max(...ys);
 
@@ -184,38 +204,15 @@ Found headers: ${headers.join(", ")}`
               >
                 {/* Setpoint */}
                 <path
-                  d={makePath(
-                    rows.map(r => ({
-                      time: r.time,
-                      value: r[axis.key].set,
-                    })),
-                    "value",
-                    w,
-                    h,
-                    pad,
-                    minY,
-                    maxY
-                  )}
+                  d={makePath(rows, axisKey, "set", w, h, pad, minY, maxY)}
                   fill="none"
                   stroke="red"
-                  strokeWidth="2"
                   strokeDasharray="6 4"
+                  strokeWidth="2"
                 />
-
                 {/* Gyro */}
                 <path
-                  d={makePath(
-                    rows.map(r => ({
-                      time: r.time,
-                      value: r[axis.key].gyro,
-                    })),
-                    "value",
-                    w,
-                    h,
-                    pad,
-                    minY,
-                    maxY
-                  )}
+                  d={makePath(rows, axisKey, "gyro", w, h, pad, minY, maxY)}
                   fill="none"
                   stroke="#0070f3"
                   strokeWidth="2"
