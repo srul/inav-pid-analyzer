@@ -12,7 +12,11 @@ const FFT_WINDOW = 512;          // power of 2
 const FFT_MIN_HZ = 20;
 const FFT_MAX_HZ = 300;
 
-/* Firmware parameter mapping (Step 12/14 behavior) */
+/* ✅ NEW DEFAULT THRESHOLDS (Step 23 updated) */
+const DEFAULT_VIB_WARN_RATIO = 2.5;
+const DEFAULT_VIB_CRIT_RATIO = 5.0;
+
+/* Firmware parameter mapping */
 const PARAMS = {
   ArduPilot: {
     notchEnable: "INS_HNTCH_ENABLE",
@@ -104,31 +108,23 @@ function clamp(x, a, b) {
   return Math.max(a, Math.min(b, x));
 }
 
-/* ================= FFT (Radix-2) =================
-   Real signal FFT → magnitude for [0..N/2)
-   This is fast enough for N=512 in browser.
-*/
+/* ================= FFT (Radix-2) ================= */
 function hannWindow(N) {
   const w = new Array(N);
-  for (let i = 0; i < N; i++) {
-    w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (N - 1)));
-  }
+  for (let i = 0; i < N; i++) w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (N - 1)));
   return w;
 }
 
 function fftMagReal(signal) {
   const N = signal.length;
-  // bit-reversed permutation
   const re = signal.slice();
   const im = new Array(N).fill(0);
 
+  // bit-reverse
   let j = 0;
   for (let i = 1; i < N; i++) {
     let bit = N >> 1;
-    while (j & bit) {
-      j ^= bit;
-      bit >>= 1;
-    }
+    while (j & bit) { j ^= bit; bit >>= 1; }
     j ^= bit;
     if (i < j) {
       [re[i], re[j]] = [re[j], re[i]];
@@ -154,17 +150,13 @@ function fftMagReal(signal) {
     }
   }
 
-  // magnitude for half spectrum
   const mags = new Array(N / 2);
-  for (let i = 0; i < N / 2; i++) {
-    mags[i] = Math.hypot(re[i], im[i]) / N;
-  }
+  for (let i = 0; i < N / 2; i++) mags[i] = Math.hypot(re[i], im[i]) / N;
   return mags;
 }
 
 /* ================= STEP 23 ANALYSIS ================= */
 function computeSampleRateHz(data) {
-  // median dt from last ~200 samples to reduce jitter
   const n = data.length;
   const take = Math.min(200, n - 1);
   const dts = [];
@@ -172,14 +164,14 @@ function computeSampleRateHz(data) {
     const dt = data[i].time - data[i - 1].time;
     if (dt > 0 && Number.isFinite(dt)) dts.push(dt);
   }
-  const dtm = median(dts) || 0.002; // fallback
+  const dtm = median(dts) || 0.002;
   return 1 / dtm;
 }
 
-function computeOvershootPct(axisSeries) {
-  const setFinal = axisSeries.set[axisSeries.set.length - 1];
+function computeOvershootPct(gyroArr, setArr) {
+  const setFinal = setArr[setArr.length - 1];
   if (!Number.isFinite(setFinal) || Math.abs(setFinal) < 1e-9) return null;
-  const peak = Math.max(...axisSeries.gyro);
+  const peak = Math.max(...gyroArr);
   return ((peak - setFinal) / Math.abs(setFinal)) * 100;
 }
 
@@ -190,20 +182,17 @@ function computeAxisFFT(axisGyro, sampleRateHz) {
   const windowed = slice.map((v, i) => v * w[i]);
   const mags = fftMagReal(windowed);
 
-  // build freq axis and find peak in band
   let bestI = -1;
   let bestMag = -1;
   const bandMags = [];
   const bandFreqs = [];
+
   for (let i = 1; i < mags.length; i++) {
     const f = (i * sampleRateHz) / FFT_WINDOW;
     if (f < FFT_MIN_HZ || f > FFT_MAX_HZ) continue;
     bandMags.push(mags[i]);
     bandFreqs.push(f);
-    if (mags[i] > bestMag) {
-      bestMag = mags[i];
-      bestI = i;
-    }
+    if (mags[i] > bestMag) { bestMag = mags[i]; bestI = i; }
   }
   if (bestI < 0) return null;
 
@@ -216,7 +205,6 @@ function computeAxisFFT(axisGyro, sampleRateHz) {
     peakMag: bestMag,
     noiseFloor,
     peakRatio,
-    // keep reduced spectrum for plotting (optional)
     spectrum: bandFreqs.map((f, idx) => ({ f, m: bandMags[idx] })),
   };
 }
@@ -224,43 +212,37 @@ function computeAxisFFT(axisGyro, sampleRateHz) {
 function notchFromFFT(fft) {
   if (!fft) return null;
   const center = Math.round(fft.peakFreq);
-  // conservative default bandwidth: about half center, clamp to sane range
   const bw = Math.round(clamp(center * 0.5, 30, 140));
-  // harmonics: 2 if motor-ish range; 1 if high frequency
   const harmonics = center < 150 ? 2 : 1;
-  // attenuation default
   const att = 40;
   return { center, bw, harmonics, att };
 }
 
-function buildReport(data) {
+function buildReport(data, vibWarnRatio, vibCritRatio) {
   const fs = computeSampleRateHz(data);
   const report = { fs, global: "OK", axes: {} };
 
   for (const axis of AXES) {
-    const series = {
-      gyro: data.map((r) => r[axis].gyro),
-      set: data.map((r) => r[axis].set),
-    };
+    const gyro = data.map((r) => r[axis].gyro);
+    const set = data.map((r) => r[axis].set);
 
-    const setFinal = series.set[series.set.length - 1];
+    const setFinal = set[set.length - 1];
     const inactive = !Number.isFinite(setFinal) || Math.abs(setFinal) < 1e-6;
 
-    const overshootPct = inactive ? null : computeOvershootPct(series);
-    const fft = computeAxisFFT(series.gyro, fs);
+    const overshootPct = inactive ? null : computeOvershootPct(gyro, set);
+    const fft = computeAxisFFT(gyro, fs);
     const notch = notchFromFFT(fft);
 
-    // axis severity: combine overshoot + vibration confidence
+    // base severity from overshoot
     let severity = "OK";
     if (!inactive && overshootPct != null) {
       if (overshootPct > 15) severity = "WARNING";
       if (overshootPct > 30) severity = "CRITICAL";
     }
 
-    // Step 23: vibration-driven escalation (jello risk)
-    // Only if peak is confident
-    const vibCritical = fft && fft.peakRatio >= 6;
-    const vibWarn = fft && fft.peakRatio >= 3;
+    // ✅ NEW THRESHOLDS USED HERE
+    const vibCritical = fft && fft.peakRatio >= vibCritRatio;
+    const vibWarn = fft && fft.peakRatio >= vibWarnRatio;
 
     if (vibCritical) severity = "CRITICAL";
     else if (vibWarn && severity === "OK") severity = "WARNING";
@@ -269,16 +251,12 @@ function buildReport(data) {
       inactive,
       overshootPct: overshootPct != null ? Number(overshootPct.toFixed(1)) : null,
       fft: fft
-        ? {
-            peakFreq: Number(fft.peakFreq.toFixed(1)),
-            peakRatio: Number(fft.peakRatio.toFixed(2)),
-          }
+        ? { peakFreq: Number(fft.peakFreq.toFixed(1)), peakRatio: Number(fft.peakRatio.toFixed(2)) }
         : null,
       notch,
       severity,
     };
 
-    // global severity aggregation
     if (severity === "CRITICAL") report.global = "CRITICAL";
     else if (severity === "WARNING" && report.global !== "CRITICAL") report.global = "WARNING";
   }
@@ -286,7 +264,7 @@ function buildReport(data) {
   return report;
 }
 
-/* ================= SVG PLOT HELPERS ================= */
+/* ================= SVG HELPERS ================= */
 function buildPolyline(points, w, h, pad = 10) {
   if (!points.length) return "";
   const xs = points.map((p) => p.x);
@@ -311,13 +289,13 @@ function downsampleSeries(arr, maxPoints) {
   return out;
 }
 
-/* ================= UI ================= */
 function severityColor(sev) {
   if (sev === "CRITICAL") return "var(--critical)";
   if (sev === "WARNING") return "var(--warning)";
   return "var(--ok)";
 }
 
+/* ================= APP ================= */
 export default function App() {
   const [fw, setFw] = useState(localStorage.getItem(FW_KEY) || "ArduPilot");
   const [theme, setTheme] = useState(getInitialTheme());
@@ -331,7 +309,10 @@ export default function App() {
   const [report, setReport] = useState(null);
   const [error, setError] = useState("");
 
-  // persist theme/fw
+  // ✅ NEW: thresholds as state (editable)
+  const [vibWarnRatio, setVibWarnRatio] = useState(DEFAULT_VIB_WARN_RATIO);
+  const [vibCritRatio, setVibCritRatio] = useState(DEFAULT_VIB_CRIT_RATIO);
+
   useEffect(() => {
     localStorage.setItem(FW_KEY, fw);
   }, [fw]);
@@ -351,7 +332,7 @@ export default function App() {
       setAxis(nextAxis);
       setVisibleAxis(nextAxis);
       setIsExiting(false);
-    }, 180); // must match exit animation duration
+    }, 180);
   };
 
   const onFile = (file) => {
@@ -363,26 +344,27 @@ export default function App() {
       file,
       (data) => {
         setRawData(data);
-        setReport(buildReport(data));
+        setReport(buildReport(data, vibWarnRatio, vibCritRatio));
       },
       (msg) => setError(msg)
     );
   };
 
+  // re-run analysis if thresholds change (when data is loaded)
+  useEffect(() => {
+    if (!rawData) return;
+    setReport(buildReport(rawData, vibWarnRatio, vibCritRatio));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [vibWarnRatio, vibCritRatio]);
+
   const chartData = useMemo(() => {
     if (!rawData) return null;
-    const series = rawData.map((r) => ({
-      t: r.time,
-      gyro: r[axis].gyro,
-      set: r[axis].set,
-    }));
-    const ds = downsampleSeries(series, 260);
-    return ds;
+    const series = rawData.map((r) => ({ t: r.time, gyro: r[axis].gyro, set: r[axis].set }));
+    return downsampleSeries(series, 260);
   }, [rawData, axis]);
 
   const spectrum = useMemo(() => {
     if (!rawData || !report?.axes?.[axis]?.fft) return null;
-    // recompute full spectrum for charts tab only (still small window)
     const fsHz = report.fs;
     const gyro = rawData.map((r) => r[axis].gyro);
     const fft = computeAxisFFT(gyro, fsHz);
@@ -393,7 +375,6 @@ export default function App() {
     <div className="app">
       <style>{`
         :root{
-          --bg:#070b14;
           --card:#0c1324;
           --border:#1e2a4a;
           --text:#e5e7eb;
@@ -404,7 +385,6 @@ export default function App() {
           --ok:#16a34a;
         }
         [data-theme="light"]{
-          --bg:#f8fafc;
           --card:#ffffff;
           --border:#d8dee9;
           --text:#0f172a;
@@ -423,40 +403,19 @@ export default function App() {
         [data-theme="light"] body{
           background: linear-gradient(#f8fafc, #eef2ff);
         }
-        .app{
-          max-width: 980px;
-          margin: 0 auto;
-          padding: 16px;
-        }
+        .app{ max-width: 980px; margin: 0 auto; padding: 16px; }
 
-        /* animations */
-        @keyframes enter {
-          from { opacity:0; transform: translateY(10px); }
-          to { opacity:1; transform: translateY(0); }
-        }
-        @keyframes exit {
-          from { opacity:1; transform: translateY(0); }
-          to { opacity:0; transform: translateY(10px); }
-        }
+        @keyframes enter { from { opacity:0; transform: translateY(10px);} to { opacity:1; transform: translateY(0);} }
+        @keyframes exit { from { opacity:1; transform: translateY(0);} to { opacity:0; transform: translateY(10px);} }
         .fade-enter { animation: enter 220ms ease-out both; }
         .fade-exit  { animation: exit 180ms ease-in both; }
 
         header h1{ margin:0; color:var(--accent); font-size: 24px; }
         header small{ color: var(--muted); }
 
-        .controls{
-          display:flex; gap:10px; flex-wrap: wrap;
-          margin: 14px 0 14px;
-        }
-        .controls input[type=file]{
-          background: var(--card);
-          border:1px dashed var(--border);
-          color: var(--muted);
-          padding: 10px;
-          border-radius: 10px;
-          width: 320px;
-        }
-        select, button{
+        .controls{ display:flex; gap:10px; flex-wrap: wrap; margin: 14px 0; align-items: center; }
+        .controls input[type=file]{ background: var(--card); border:1px dashed var(--border); color: var(--muted); padding: 10px; border-radius: 10px; width: 320px; }
+        select, button, input[type=number]{
           background: var(--card);
           color: var(--text);
           border: 1px solid var(--border);
@@ -464,6 +423,7 @@ export default function App() {
           border-radius: 10px;
         }
         button{ cursor:pointer; }
+
         .summary{
           background: linear-gradient(135deg, var(--card), rgba(0,0,0,0));
           border:1px solid var(--border);
@@ -485,41 +445,15 @@ export default function App() {
           letter-spacing: .5px;
         }
 
-        .tabs{
-          display:flex; gap: 16px;
-          margin-top: 16px;
-          border-bottom: 1px solid var(--border);
-        }
-        .tabs button{
-          border: none;
-          border-radius: 0;
-          background: transparent;
-          padding: 10px 0;
-          color: var(--muted);
-        }
-        .tabs button.active{
-          color: var(--accent);
-          border-bottom: 2px solid var(--accent);
-        }
+        .tabs{ display:flex; gap: 16px; margin-top: 16px; border-bottom: 1px solid var(--border); }
+        .tabs button{ border: none; border-radius: 0; background: transparent; padding: 10px 0; color: var(--muted); }
+        .tabs button.active{ color: var(--accent); border-bottom: 2px solid var(--accent); }
 
-        .axis-tabs{
-          display:flex; gap: 8px;
-          margin: 14px 0;
-        }
-        .axis-tabs button{
-          flex: 1;
-          background: var(--card);
-        }
-        .axis-tabs button.active{
-          outline: 2px solid rgba(56,189,248,0.35);
-          background: rgba(56,189,248,0.08);
-        }
+        .axis-tabs{ display:flex; gap: 8px; margin: 14px 0; }
+        .axis-tabs button{ flex: 1; background: var(--card); }
+        .axis-tabs button.active{ outline: 2px solid rgba(56,189,248,0.35); background: rgba(56,189,248,0.08); }
 
-        .grid{
-          display: grid;
-          grid-template-columns: 1fr;
-          gap: 12px;
-        }
+        .grid{ display: grid; grid-template-columns: 1fr; gap: 12px; }
 
         .card{
           background: var(--card);
@@ -545,34 +479,14 @@ export default function App() {
           color: var(--muted);
         }
 
-        .kpiRow{
-          display:grid;
-          grid-template-columns: 1fr 1fr;
-          gap: 10px;
-          margin-top: 12px;
-        }
-        .kpi{
-          background: rgba(255,255,255,0.02);
-          border: 1px solid var(--border);
-          border-radius: 12px;
-          padding: 12px;
-        }
-        [data-theme="light"] .kpi{
-          background: rgba(2,8,23,0.02);
-        }
+        .kpiRow{ display:grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+        .kpi{ background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+        [data-theme="light"] .kpi{ background: rgba(2,8,23,0.02); }
         .kpi .label{ color: var(--muted); font-size: 12px; }
         .kpi .value{ font-size: 18px; font-weight: 700; margin-top: 4px; }
 
-        .chart{
-          background: rgba(255,255,255,0.02);
-          border: 1px solid var(--border);
-          border-radius: 12px;
-          padding: 10px;
-          overflow: hidden;
-        }
-        [data-theme="light"] .chart{
-          background: rgba(2,8,23,0.02);
-        }
+        .chart{ background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: 12px; padding: 10px; overflow: hidden; }
+        [data-theme="light"] .chart{ background: rgba(2,8,23,0.02); }
       `}</style>
 
       <header>
@@ -583,13 +497,35 @@ export default function App() {
       <div className="controls">
         <input type="file" accept=".csv" onChange={(e) => onFile(e.target.files?.[0])} />
         <select value={fw} onChange={(e) => setFw(e.target.value)}>
-          {FIRMWARES.map((x) => (
-            <option key={x} value={x}>{x}</option>
-          ))}
+          {FIRMWARES.map((x) => <option key={x} value={x}>{x}</option>)}
         </select>
         <button onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
           {theme === "dark" ? "☀️ Light" : "🌙 Dark"}
         </button>
+
+        {/* ✅ NEW: Threshold controls */}
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span style={{ color: "var(--muted)", fontSize: 12 }}>Vib warn ≥</span>
+          <input
+            type="number"
+            step="0.1"
+            min="1"
+            max="20"
+            value={vibWarnRatio}
+            onChange={(e) => setVibWarnRatio(Number(e.target.value))}
+            style={{ width: 90 }}
+          />
+          <span style={{ color: "var(--muted)", fontSize: 12 }}>crit ≥</span>
+          <input
+            type="number"
+            step="0.1"
+            min="1"
+            max="20"
+            value={vibCritRatio}
+            onChange={(e) => setVibCritRatio(Number(e.target.value))}
+            style={{ width: 90 }}
+          />
+        </div>
       </div>
 
       {error && <div style={{ color: "var(--critical)" }}>{error}</div>}
@@ -624,38 +560,34 @@ export default function App() {
             ))}
           </div>
 
-          {/* CONTENT AREA WITH EXIT/ENTER */}
           <div className={isExiting ? "fade-exit" : "fade-enter"}>
-
             {section === "Overview" && (
-              <>
-                <div className="kpiRow">
-                  <div className="kpi">
-                    <div className="label">Axis severity</div>
-                    <div className="value" style={{ color: severityColor(report.axes[axis].severity) }}>
-                      {report.axes[axis].severity}
-                    </div>
-                  </div>
-                  <div className="kpi">
-                    <div className="label">Overshoot</div>
-                    <div className="value">
-                      {report.axes[axis].overshootPct == null ? "—" : `${report.axes[axis].overshootPct}%`}
-                    </div>
-                  </div>
-                  <div className="kpi">
-                    <div className="label">Dominant vibration (FFT)</div>
-                    <div className="value">
-                      {report.axes[axis].fft?.peakFreq ? `${report.axes[axis].fft.peakFreq} Hz` : "—"}
-                    </div>
-                  </div>
-                  <div className="kpi">
-                    <div className="label">Peak / noise ratio</div>
-                    <div className="value">
-                      {report.axes[axis].fft?.peakRatio ? `${report.axes[axis].fft.peakRatio}×` : "—"}
-                    </div>
+              <div className="kpiRow">
+                <div className="kpi">
+                  <div className="label">Axis severity</div>
+                  <div className="value" style={{ color: severityColor(report.axes[axis].severity) }}>
+                    {report.axes[axis].severity}
                   </div>
                 </div>
-              </>
+                <div className="kpi">
+                  <div className="label">Overshoot</div>
+                  <div className="value">
+                    {report.axes[axis].overshootPct == null ? "—" : `${report.axes[axis].overshootPct}%`}
+                  </div>
+                </div>
+                <div className="kpi">
+                  <div className="label">Dominant vibration (FFT)</div>
+                  <div className="value">
+                    {report.axes[axis].fft?.peakFreq ? `${report.axes[axis].fft.peakFreq} Hz` : "—"}
+                  </div>
+                </div>
+                <div className="kpi">
+                  <div className="label">Peak / noise ratio</div>
+                  <div className="value">
+                    {report.axes[axis].fft?.peakRatio ? `${report.axes[axis].fft.peakRatio}×` : "—"}
+                  </div>
+                </div>
+              </div>
             )}
 
             {section === "Charts" && chartData && (
@@ -711,7 +643,6 @@ export default function App() {
 
             {section === "Recommendations" && (
               <div className="grid">
-                {/* Inactive axis */}
                 {report.axes[axis].inactive && (
                   <div className="card OK">
                     <h3>No control activity detected</h3>
@@ -719,13 +650,13 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Step 23: FFT-based notch refinement */}
                 {!report.axes[axis].inactive && report.axes[axis].notch && (
                   <div className={`card ${report.axes[axis].severity === "CRITICAL" ? "CRITICAL" : "WARNING"}`}>
                     <h3>Enable Harmonic Notch Filter (FFT‑detected)</h3>
                     <p>
                       Dominant vibration at <b>{report.axes[axis].fft?.peakFreq ?? "—"} Hz</b>{" "}
-                      (peak/noise {report.axes[axis].fft?.peakRatio ?? "—"}×). These values are computed from the log.
+                      (peak/noise {report.axes[axis].fft?.peakRatio ?? "—"}×).
+                      Thresholds: warn ≥ {vibWarnRatio}×, crit ≥ {vibCritRatio}×.
                     </p>
 
                     <div className="param"><span>{P.notchEnable}</span><span>1</span></div>
@@ -737,7 +668,6 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Overshoot advice */}
                 {!report.axes[axis].inactive && report.axes[axis].overshootPct != null && report.axes[axis].overshootPct > 15 && (
                   <div className="card WARNING">
                     <h3>High Overshoot</h3>
@@ -746,17 +676,14 @@ export default function App() {
                   </div>
                 )}
 
-                {/* OK */}
-                {!report.axes[axis].inactive &&
-                  (report.axes[axis].severity === "OK") && (
-                    <div className="card OK">
-                      <h3>Tune looks balanced</h3>
-                      <p>No critical issues detected for this axis in the current heuristics.</p>
-                    </div>
-                  )}
+                {!report.axes[axis].inactive && report.axes[axis].severity === "OK" && (
+                  <div className="card OK">
+                    <h3>Tune looks balanced</h3>
+                    <p>No critical issues detected for this axis in the current heuristics.</p>
+                  </div>
+                )}
               </div>
             )}
-
           </div>
         </>
       )}
