@@ -18,16 +18,21 @@ const norm = (h) => String(h ?? "").trim().toLowerCase();
 
 function guessColumns(headers) {
   const h = headers.map(norm);
-  const pick = (arr) => arr.map((x) => headers[h.indexOf(x)]).filter(Boolean);
+  const pick = (k) =>
+    headers[h.findIndex((x) => x === k)] ?? null;
 
   return {
-    time: headers[h.indexOf("time")] || headers[h.indexOf("time_us")] || headers[0],
-    gyro: pick(["gyro[0]", "gyro[1]", "gyro[2]"]),
-    set: pick(["setpoint[0]", "setpoint[1]", "setpoint[2]", "rccommand[0]"]),
+    time: pick("time") || pick("time_us") || headers[0],
+    gyro: [pick("gyro[0]"), pick("gyro[1]"), pick("gyro[2]")],
+    set: [
+      pick("setpoint[0]") || pick("rccommand[0]"),
+      pick("setpoint[1]") || pick("rccommand[1]"),
+      pick("setpoint[2]") || pick("rccommand[2]"),
+    ],
   };
 }
 
-/* ====================== NUMERICS ====================== */
+/* ====================== UTILS ====================== */
 
 function rms(arr) {
   const v = arr.filter(isNum);
@@ -35,7 +40,7 @@ function rms(arr) {
   return Math.sqrt(v.reduce((a, b) => a + b * b, 0) / v.length);
 }
 
-/* ====================== TIME DOMAIN METRICS ====================== */
+/* ====================== TIME‑DOMAIN METRICS ====================== */
 
 function stepResponseMetrics(sp, gy) {
   const n = Math.min(sp.length, gy.length);
@@ -45,7 +50,9 @@ function stepResponseMetrics(sp, gy) {
   for (let i = 1; i < n; i++) {
     if (Math.abs(sp[i] - sp[i - 1]) > 5) steps.push(i);
   }
-  if (!steps.length) return { overshoot_pct: 0, settle_ms: null, sse: 0 };
+
+  if (!steps.length)
+    return { overshoot_pct: 0, settle_ms: null, sse: 0 };
 
   const overs = [];
   const settles = [];
@@ -54,7 +61,6 @@ function stepResponseMetrics(sp, gy) {
   steps.slice(0, 3).forEach((idx) => {
     const target = sp[idx];
     const seg = gy.slice(idx, idx + 300);
-
     const peak = Math.max(...seg);
     overs.push(Math.max(0, ((peak - target) / Math.abs(target)) * 100));
 
@@ -73,7 +79,9 @@ function stepResponseMetrics(sp, gy) {
 
   return {
     overshoot_pct: overs.reduce((a, b) => a + b, 0) / overs.length,
-    settle_ms: settles.length ? settles.reduce((a, b) => a + b, 0) / settles.length : null,
+    settle_ms: settles.length
+      ? settles.reduce((a, b) => a + b, 0) / settles.length
+      : null,
     sse: sse.reduce((a, b) => a + b, 0) / sse.length,
   };
 }
@@ -84,20 +92,17 @@ function computeTuneScore(m) {
   let s = 100;
   if (m.overshoot_pct > 20) s -= 25;
   else if (m.overshoot_pct > 10) s -= 15;
-
   if (m.settle_ms > 500) s -= 20;
   else if (m.settle_ms > 350) s -= 10;
-
   if (m.noise_rms > 18) s -= 20;
   else if (m.noise_rms > 12) s -= 10;
-
   if (Math.abs(m.sse) > 2) s -= 10;
   return Math.max(0, Math.min(100, Math.round(s)));
 }
 
 /* ====================== FFT ====================== */
 
-// Radix‑2 FFT magnitude (real input)
+// radix‑2 FFT magnitude
 function fftMagnitude(signal) {
   const N = signal.length;
   if (N & (N - 1)) return null;
@@ -133,9 +138,8 @@ function fftMagnitude(signal) {
 function computeFFT(signal, sampleRateHz = 1000) {
   const N = 2048;
   if (signal.length < N) return null;
-  const slice = signal.slice(-N);
 
-  // Hanning window
+  const slice = signal.slice(-N);
   const windowed = slice.map(
     (v, i) => v * (0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (N - 1)))
   );
@@ -157,14 +161,24 @@ function detectPeaks(freqs, mag) {
   return peaks.sort((a, b) => b.amp - a.amp).slice(0, 3);
 }
 
-function classifyVibration(peaks) {
-  if (!peaks.length) return { level: "low", text: "No dominant vibration detected" };
-  const p = peaks[0];
-  if (p.amp > 50)
-    return { level: "high", text: `High vibration at ${p.freq.toFixed(1)} Hz (motor/prop)` };
-  if (p.amp > 20)
-    return { level: "moderate", text: `Moderate vibration around ${p.freq.toFixed(1)} Hz` };
-  return { level: "low", text: "Minor vibration only" };
+/* ====================== NOTCH FILTER LOGIC ====================== */
+
+function buildNotchRecommendation(peaks) {
+  if (!peaks.length) return null;
+
+  const main = peaks[0];
+  const center = Math.round(main.freq);
+  const bandwidth = Math.round(Math.max(20, center * 0.4)); // ~±20–40%
+  const harmonics = center < 150 ? 2 : 1;
+
+  return {
+    center_hz: center,
+    bandwidth_hz: bandwidth,
+    attenuation_db: 40,
+    harmonics,
+    text: `Strong vibration at ~${center} Hz suggests motor/prop resonance. 
+Enable harmonic notch centered at ${center} Hz with ~${bandwidth} Hz bandwidth.`,
+  };
 }
 
 /* ====================== ANALYSIS ====================== */
@@ -188,7 +202,7 @@ function analyzeCSV(file) {
       const peaks = detectPeaks(fft.freqs, fft.mag);
       m.fft = fft;
       m.peaks = peaks;
-      m.vibration = classifyVibration(peaks);
+      m.notch = buildNotchRecommendation(peaks);
     }
 
     m.gyro = gy;
@@ -202,11 +216,10 @@ function analyzeCSV(file) {
 /* ====================== APP ====================== */
 
 export default function App() {
-  const [baseline, setBaseline] = useState(null);
   const [candidate, setCandidate] = useState(null);
   const [axis, setAxis] = useState("roll");
 
-  function loadFile(e, setter) {
+  function loadFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
     const r = new FileReader();
@@ -222,42 +235,21 @@ export default function App() {
         });
         return o;
       });
-      setter({ rows, headers, cols: guessColumns(headers), name: f.name });
+      setCandidate({ rows, headers, cols: guessColumns(headers), name: f.name });
     };
     r.readAsText(f);
   }
 
-  const before = useMemo(() => analyzeCSV(baseline), [baseline]);
-  const after = useMemo(() => analyzeCSV(candidate), [candidate]);
-
-  const plotData =
-    before && after && after[axis]
-      ? [
-          { y: before[axis].gyro, name: "Baseline Gyro", type: "scattergl" },
-          { y: after[axis].gyro, name: "Candidate Gyro", type: "scattergl" },
-          { y: before[axis].set, name: "Baseline Setpoint", dash: "dash", type: "scattergl" },
-          { y: after[axis].set, name: "Candidate Setpoint", dash: "dash", type: "scattergl" },
-        ]
-      : [];
+  const data = useMemo(() => analyzeCSV(candidate), [candidate]);
 
   return (
     <div className="app">
-      <h1>PID Analyzer — Compare & FFT</h1>
+      <h1>PID Analyzer — FFT & Notch Recommendations</h1>
 
-      <div style={{ display: "flex", gap: 20 }}>
-        <div>
-          <h3>Baseline</h3>
-          <input type="file" onChange={(e) => loadFile(e, setBaseline)} />
-          {baseline?.name}
-        </div>
-        <div>
-          <h3>Candidate</h3>
-          <input type="file" onChange={(e) => loadFile(e, setCandidate)} />
-          {candidate?.name}
-        </div>
-      </div>
+      <input type="file" onChange={loadFile} />
+      {candidate?.name}
 
-      {after && (
+      {data && (
         <div style={{ marginTop: 20 }}>
           Axis:&nbsp;
           {AXES.map((a) => (
@@ -268,50 +260,37 @@ export default function App() {
         </div>
       )}
 
-      {before && after && (
+      {data && data[axis] && (
         <>
           <Plot
-            data={plotData}
-            layout={{ title: "Time Domain Compare", height: 400 }}
+            data={[
+              {
+                x: data[axis].fft.freqs,
+                y: data[axis].fft.mag,
+                type: "scatter",
+                mode: "lines",
+              },
+            ]}
+            layout={{
+              title: `FFT Spectrum — ${axis.toUpperCase()}`,
+              xaxis: { title: "Frequency (Hz)", range: [0, 300] },
+              yaxis: { title: "Magnitude" },
+              height: 300,
+            }}
             style={{ width: "100%" }}
           />
 
-          <h3>FFT — {axis.toUpperCase()}</h3>
-
-          {after[axis].fft && (
-            <>
-              <Plot
-                data={[
-                  {
-                    x: after[axis].fft.freqs,
-                    y: after[axis].fft.mag,
-                    type: "scatter",
-                  },
-                ]}
-                layout={{
-                  xaxis: { title: "Frequency (Hz)", range: [0, 300] },
-                  yaxis: { title: "Magnitude" },
-                  height: 300,
-                }}
-                style={{ width: "100%" }}
-              />
-
-              <div>
-                <b>Vibration Risk:</b>{" "}
-                <span
-                  style={{
-                    color:
-                      after[axis].vibration.level === "high"
-                        ? "red"
-                        : after[axis].vibration.level === "moderate"
-                        ? "orange"
-                        : "green",
-                  }}
-                >
-                  {after[axis].vibration.text}
-                </span>
-              </div>
-            </>
+          {data[axis].notch && (
+            <div style={{ marginTop: 10 }}>
+              <h3>Notch Filter Recommendation</h3>
+              <ul>
+                <li><b>Center Frequency:</b> {data[axis].notch.center_hz} Hz</li>
+                <li><b>Bandwidth:</b> {data[axis].notch.bandwidth_hz} Hz</li>
+                <li><b>Attenuation:</b> {data[axis].notch.attenuation_db} dB</li>
+                <li><b>Harmonics:</b> {data[axis].notch.harmonics}</li>
+              </ul>
+              <p>{data[axis].notch.text}</p>
+            </div>
           )}
         </>
       )}
