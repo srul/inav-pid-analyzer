@@ -1,9 +1,10 @@
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 
 /* ================= CONFIG ================= */
 const AXES = ["roll", "pitch", "yaw"];
 const SEVERITY_ORDER = { OK: 0, WARNING: 1, CRITICAL: 2 };
 const PRESET_KEY = "pid-analyzer-presets";
+const THEME_KEY = "pid-analyzer-theme";
 
 /* ================= STORAGE ================= */
 function loadPresets() {
@@ -15,6 +16,15 @@ function loadPresets() {
 }
 function savePresets(presets) {
   localStorage.setItem(PRESET_KEY, JSON.stringify(presets));
+}
+
+/* ================= THEME ================= */
+function getInitialTheme() {
+  const saved = localStorage.getItem(THEME_KEY);
+  if (saved) return saved;
+  return window.matchMedia("(prefers-color-scheme: dark)").matches
+    ? "dark"
+    : "light";
 }
 
 /* ================= URL (Step 18) ================= */
@@ -108,7 +118,14 @@ export default function App() {
   const [presets, setPresets] = useState(loadPresets());
   const [presetName, setPresetName] = useState("");
   const [printMode, setPrintMode] = useState(false);
+  const [theme, setTheme] = useState(getInitialTheme());
   const [error, setError] = useState("");
+
+  /* Apply theme */
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
 
   /* Restore from URL */
   useEffect(() => {
@@ -138,25 +155,54 @@ export default function App() {
 
   function enterPrint() {
     setPrintMode(true);
+    document.documentElement.setAttribute("data-theme", "light");
     setTimeout(() => window.print(), 50);
   }
 
   function exitPrint() {
     setPrintMode(false);
+    document.documentElement.setAttribute("data-theme", theme);
   }
 
   return (
-    <div className={printMode ? "print" : ""} style={{ padding: 20, maxWidth: 900, margin: "auto" }}>
+    <div style={{ padding: 20, maxWidth: 900, margin: "auto" }}>
       <style>{`
+        :root {
+          --bg: #ffffff;
+          --fg: #111827;
+          --card: #f3f4f6;
+          --border: #d1d5db;
+        }
+        [data-theme="dark"] {
+          --bg: #020617;
+          --fg: #e5e7eb;
+          --card: #020617;
+          --border: #334155;
+        }
+        body {
+          background: var(--bg);
+          color: var(--fg);
+        }
+        table {
+          border-collapse: collapse;
+        }
+        th, td {
+          border: 1px solid var(--border);
+        }
         @media print {
-          body { background: white; color: black; }
           button, input { display: none !important; }
-          .no-print { display: none !important; }
         }
       `}</style>
 
-      {!printMode && <h1>PID Analyzer — Step 20 (Print View)</h1>}
-      {printMode && <h1>PID Tuning Report</h1>}
+      <h1>PID Analyzer — Step 21 (Theme Toggle)</h1>
+
+      {!printMode && (
+        <button
+          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+        >
+          {theme === "dark" ? "☀️ Light Mode" : "🌙 Dark Mode"}
+        </button>
+      )}
 
       {!printMode && (
         <input
@@ -180,19 +226,21 @@ export default function App() {
 
           <h2>
             Global Status:{" "}
-            <span style={{
-              color:
-                report.global === "CRITICAL"
-                  ? "red"
-                  : report.global === "WARNING"
-                  ? "orange"
-                  : "green"
-            }}>
+            <span
+              style={{
+                color:
+                  report.global === "CRITICAL"
+                    ? "red"
+                    : report.global === "WARNING"
+                    ? "orange"
+                    : "green"
+              }}
+            >
               {report.global}
             </span>
           </h2>
 
-          <table border="1" cellPadding="6" width="100%">
+          <table cellPadding="6" width="100%">
             <thead>
               <tr>
                 <th>Axis</th>
@@ -240,17 +288,11 @@ export default function App() {
               )}
             </>
           )}
-
-          {printMode && (
-            <p style={{ marginTop: 20 }}>
-              © PID Analyzer — Generated automatically
-            </p>
-          )}
         </>
       )}
 
       {printMode && (
-        <button className="no-print" onClick={exitPrint}>
+        <button onClick={exitPrint} style={{ marginTop: 20 }}>
           Exit Print Mode
         </button>
       )}
