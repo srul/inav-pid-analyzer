@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import Plot from "react-plotly.js";
 import "./App.css";
 
 /* ====================== CONSTANTS ====================== */
@@ -38,8 +39,18 @@ function pickIncludes(headers, patterns) {
 function guessColumns(headers) {
   return {
     time: pickFirst(headers, ["time", "time_us", "timestamp", "t"]),
-    gyro: pickIncludes(headers, ["gyro[0]", "gyro[1]", "gyro[2]", "gyro_roll"]).slice(0, 3),
-    set: pickIncludes(headers, ["setpoint[0]", "setpoint[1]", "setpoint[2]", "rccommand"]).slice(0, 3),
+    gyro: pickIncludes(headers, [
+      "gyro[0]",
+      "gyro[1]",
+      "gyro[2]",
+      "gyro_roll",
+    ]).slice(0, 3),
+    set: pickIncludes(headers, [
+      "setpoint[0]",
+      "setpoint[1]",
+      "setpoint[2]",
+      "rccommand",
+    ]).slice(0, 3),
   };
 }
 
@@ -86,12 +97,12 @@ function stepResponseMetrics(sp, gy) {
 
   return {
     overshoot_pct: overs.reduce((a, b) => a + b, 0) / overs.length,
-    settle_ms: settles.length ? settles.reduce((a, b) => a + b, 0) / settles.length : null,
+    settle_ms: settles.length
+      ? settles.reduce((a, b) => a + b, 0) / settles.length
+      : null,
     sse: sse.reduce((a, b) => a + b, 0) / sse.length,
   };
 }
-
-/* ====================== SCORING / WARNINGS ====================== */
 
 function computeTuneScore(m) {
   let s = 100;
@@ -109,7 +120,6 @@ function computeTuneScore(m) {
 
 function analyzeCSV(fileInfo) {
   if (!fileInfo) return null;
-
   const { rows, cols } = fileInfo;
   const out = {};
 
@@ -122,9 +132,12 @@ function analyzeCSV(fileInfo) {
     if (!m) return;
 
     m.noise_rms = rms(gy.filter((_, i) => Math.abs(sp[i] ?? 0) < 5));
-    const score = computeTuneScore(m);
-
-    out[a.key] = { ...m, score };
+    out[a.key] = {
+      ...m,
+      score: computeTuneScore(m),
+      gyro: gy,
+      set: sp,
+    };
   });
 
   return out;
@@ -135,11 +148,11 @@ function analyzeCSV(fileInfo) {
 export default function App() {
   const [baseline, setBaseline] = useState(null);
   const [candidate, setCandidate] = useState(null);
+  const [axis, setAxis] = useState("roll");
 
   function loadFile(e, setter) {
     const f = e.target.files?.[0];
     if (!f) return;
-
     const r = new FileReader();
     r.onload = () => {
       const lines = String(r.result).split(/\r?\n/).filter(Boolean);
@@ -153,7 +166,6 @@ export default function App() {
         });
         return o;
       });
-
       setter({ rows, headers, cols: guessColumns(headers), name: f.name });
     };
     r.readAsText(f);
@@ -162,9 +174,49 @@ export default function App() {
   const before = useMemo(() => analyzeCSV(baseline), [baseline]);
   const after = useMemo(() => analyzeCSV(candidate), [candidate]);
 
+  /* ====================== COMPARE PLOT ====================== */
+
+  const comparePlot = useMemo(() => {
+    if (!before || !after) return [];
+    const b = before[axis];
+    const c = after[axis];
+    if (!b || !c) return [];
+
+    return [
+      {
+        y: b.gyro,
+        type: "scatter",
+        mode: "lines",
+        name: "Baseline Gyro",
+        line: { color: "#999" },
+      },
+      {
+        y: c.gyro,
+        type: "scatter",
+        mode: "lines",
+        name: "Candidate Gyro",
+        line: { color: AXES.find((a) => a.key === axis).color },
+      },
+      {
+        y: b.set,
+        type: "scatter",
+        mode: "lines",
+        name: "Baseline Setpoint",
+        line: { color: "#999", dash: "dash" },
+      },
+      {
+        y: c.set,
+        type: "scatter",
+        mode: "lines",
+        name: "Candidate Setpoint",
+        line: { color: "#000", dash: "dash" },
+      },
+    ];
+  }, [before, after, axis]);
+
   return (
     <div className="app">
-      <h1>iNav PID Analyzer — Compare</h1>
+      <h1>iNav PID Analyzer — Compare Plot</h1>
 
       <div style={{ display: "flex", gap: 20 }}>
         <div>
@@ -180,40 +232,78 @@ export default function App() {
       </div>
 
       {before && after && (
-        <table style={{ marginTop: 30, width: "100%", borderCollapse: "collapse" }}>
-          <thead>
-            <tr>
-              <th>Axis</th>
-              <th>Score</th>
-              <th>Δ Score</th>
-              <th>Overshoot %</th>
-              <th>Settling</th>
-              <th>Noise</th>
-            </tr>
-          </thead>
-          <tbody>
-            {AXES.map((a) => {
-              const b = before[a.key];
-              const c = after[a.key];
-              if (!b || !c) return null;
+        <>
+          <div style={{ marginTop: 20 }}>
+            Axis:&nbsp;
+            {AXES.map((a) => (
+              <button
+                key={a.key}
+                onClick={() => setAxis(a.key)}
+                style={{
+                  marginRight: 6,
+                  fontWeight: axis === a.key ? "bold" : "normal",
+                }}
+              >
+                {a.label}
+              </button>
+            ))}
+          </div>
 
-              const dScore = c.score - b.score;
+          {/* COMPARE TABLE */}
+          <table
+            style={{
+              marginTop: 20,
+              width: "100%",
+              borderCollapse: "collapse",
+            }}
+          >
+            <thead>
+              <tr>
+                <th>Axis</th>
+                <th>Score</th>
+                <th>Δ</th>
+                <th>Overshoot</th>
+                <th>Settling</th>
+                <th>Noise</th>
+              </tr>
+            </thead>
+            <tbody>
+              {AXES.map((a) => {
+                const b = before[a.key];
+                const c = after[a.key];
+                if (!b || !c) return null;
+                const d = c.score - b.score;
+                return (
+                  <tr key={a.key} style={{ borderTop: "1px solid #ddd" }}>
+                    <td>{a.label}</td>
+                    <td>{b.score} → {c.score}</td>
+                    <td style={{ color: d >= 0 ? "green" : "red" }}>
+                      {d >= 0 ? "+" : ""}{d}
+                    </td>
+                    <td>{b.overshoot_pct.toFixed(1)} → {c.overshoot_pct.toFixed(1)}</td>
+                    <td>{b.settle_ms?.toFixed(0) ?? "–"} → {c.settle_ms?.toFixed(0) ?? "–"}</td>
+                    <td>{b.noise_rms.toFixed(2)} → {c.noise_rms.toFixed(2)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
 
-              return (
-                <tr key={a.key} style={{ borderTop: "1px solid #ddd" }}>
-                  <td><b>{a.label}</b></td>
-                  <td>{b.score} → {c.score}</td>
-                  <td style={{ color: dScore >= 0 ? "green" : "red" }}>
-                    {dScore >= 0 ? "+" : ""}{dScore}
-                  </td>
-                  <td>{b.overshoot_pct.toFixed(1)} → {c.overshoot_pct.toFixed(1)}</td>
-                  <td>{b.settle_ms?.toFixed(0) ?? "–"} → {c.settle_ms?.toFixed(0) ?? "–"}</td>
-                  <td>{b.noise_rms.toFixed(2)} → {c.noise_rms.toFixed(2)}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+          {/* COMPARE PLOT */}
+          <div style={{ marginTop: 30 }}>
+            <Plot
+              data={comparePlot}
+              layout={{
+                title: `Compare Plot — ${axis.toUpperCase()}`,
+                yaxis: { title: "Rate" },
+                xaxis: { title: "Samples" },
+                legend: { orientation: "h" },
+              }}
+              style={{ width: "100%", height: 450 }}
+              config={{ responsive: true }}
+            />
+          </div>
+        </>
       )}
     </div>
   );
