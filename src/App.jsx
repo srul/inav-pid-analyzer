@@ -1,4 +1,5 @@
 import { useState } from "react";
+import jsPDF from "jspdf";
 
 /* ================= CONFIG ================= */
 const AXES = [
@@ -24,194 +25,166 @@ const FIRMWARES = {
   },
 };
 
-const FFT_SAMPLES = 512;
+/* ================= EXPORT HELPERS ================= */
+function downloadJSON(obj, filename) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], {
+    type: "application/json",
+  });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+}
 
-/* ================= CSV ================= */
-function parseCSV(file, ok, err) {
-  const r = new FileReader();
-  r.onload = () => {
-    try {
-      const l = String(r.result).split(/\r?\n/).filter(Boolean);
-      let d = ",";
-      if (l[0].includes("\t")) d = "\t";
-      else if (l[0].includes(";")) d = ";";
+function exportPDF(report) {
+  const doc = new jsPDF();
+  let y = 10;
 
-      const h = l[0].split(d);
-      const ti = h.indexOf("time");
-      const g = {
-        roll: h.indexOf("gyro[0]"),
-        pitch: h.indexOf("gyro[1]"),
-        yaw: h.indexOf("gyro[2]"),
-        rollSp: h.indexOf("setpoint[0]"),
-        pitchSp: h.indexOf("setpoint[1]"),
-        yawSp: h.indexOf("setpoint[2]"),
-      };
+  doc.setFontSize(16);
+  doc.text("PID Tuning Report", 10, y);
+  y += 10;
 
-      ok(
-        l.slice(1).map(r => {
-          const p = r.split(d);
-          return {
-            time: +p[ti],
-            roll: { gyro: +p[g.roll], set: +p[g.rollSp] },
-            pitch: { gyro: +p[g.pitch], set: +p[g.pitchSp] },
-            yaw: { gyro: +p[g.yaw], set: +p[g.yawSp] },
-          };
-        }).filter(r => !isNaN(r.time))
-      );
-    } catch (e) {
-      err(e.message);
+  doc.setFontSize(11);
+  doc.text(`Firmware: ${report.firmware}`, 10, y); y += 6;
+  doc.text(`Global Severity: ${report.globalSeverity}`, 10, y); y += 8;
+
+  report.entries.forEach(entry => {
+    doc.setFontSize(13);
+    doc.text(`${entry.axis.toUpperCase()} — ${entry.severity}`, 10, y);
+    y += 6;
+
+    doc.setFontSize(10);
+    entry.cards.forEach(c => {
+      doc.text(`• ${c.severity}: ${c.title}`, 12, y);
+      y += 5;
+      if (c.params) {
+        c.params.forEach(p => {
+          doc.text(
+            `   ${p.name}: ${p.value}`,
+            14,
+            y
+          );
+          y += 4;
+        });
+      }
+    });
+    y += 6;
+    if (y > 270) {
+      doc.addPage();
+      y = 10;
     }
+  });
+
+  doc.save("pid-tuning-report.pdf");
+}
+
+/* ================= DEMO DATA (from previous steps) ================= */
+function buildDemoReport(firmware) {
+  return {
+    firmware,
+    globalSeverity: "CRITICAL",
+    generatedAt: new Date().toISOString(),
+    entries: [
+      {
+        axis: "roll",
+        severity: "CRITICAL",
+        cards: [
+          {
+            severity: "CRITICAL",
+            title: "Enable Harmonic Notch Filter",
+            params: [
+              { name: FIRMWARES[firmware].notchEnable, value: "1" },
+              { name: FIRMWARES[firmware].notchFreq, value: "120 Hz" },
+              { name: FIRMWARES[firmware].notchBW, value: "60 Hz" },
+            ],
+          },
+          {
+            severity: "WARNING",
+            title: "High Overshoot",
+            params: [
+              { name: FIRMWARES[firmware].rateP, value: "Reduce 5–10%" },
+            ],
+          },
+        ],
+      },
+      {
+        axis: "pitch",
+        severity: "OK",
+        cards: [
+          {
+            severity: "OK",
+            title: "No Issues Detected",
+          },
+        ],
+      },
+      {
+        axis: "yaw",
+        severity: "OK",
+        cards: [
+          {
+            severity: "OK",
+            title: "No Issues Detected",
+          },
+        ],
+      },
+    ],
   };
-  r.readAsText(file);
-}
-
-/* ================= STEP 15 UI HELPERS ================= */
-const colors = {
-  CRITICAL: "#dc2626",
-  WARNING: "#f59e0b",
-  OK: "#16a34a",
-};
-
-/* ================= UI COMPONENTS ================= */
-
-function SummaryHeader({ severity }) {
-  return (
-    <div style={{
-      position: "sticky",
-      top: 0,
-      zIndex: 10,
-      padding: 14,
-      background: "#020617",
-      borderBottom: `2px solid ${colors[severity]}`,
-    }}>
-      <h2 style={{ color: colors[severity], margin: 0 }}>
-        {severity === "CRITICAL"
-          ? "Tune Needs Attention"
-          : severity === "WARNING"
-          ? "Tune Has Warnings"
-          : "Tune Looks Good"}
-      </h2>
-    </div>
-  );
-}
-
-function Card({ severity, title, body, params }) {
-  return (
-    <div style={{
-      background: "#020617",
-      borderLeft: `6px solid ${colors[severity]}`,
-      padding: 16,
-      borderRadius: 8,
-      marginBottom: 14,
-    }}>
-      <strong style={{ color: colors[severity] }}>{severity}</strong>
-      <div style={{ fontSize: 16, marginTop: 4 }}>{title}</div>
-      <div style={{ color: "#9ca3af", marginTop: 6 }}>{body}</div>
-
-      {params && (
-        <div style={{ marginTop: 10 }}>
-          {params.map((p, i) => (
-            <div key={i} style={{
-              fontFamily: "monospace",
-              fontSize: 13,
-              display: "flex",
-              justifyContent: "space-between",
-            }}>
-              <span>{p.name}</span>
-              <span>{p.value}</span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
 }
 
 /* ================= APP ================= */
 export default function App() {
-  const [data, setData] = useState(null);
-  const [axis, setAxis] = useState("roll");
   const [firmware, setFirmware] = useState("ArduPilot");
 
-  // --- DEMO SEVERITY / CARDS (logic already proven earlier steps) ---
-  const severity = "CRITICAL";
-  const cards = [
-    {
-      severity: "CRITICAL",
-      title: "Enable Harmonic Notch Filter",
-      body: "Motor vibration enters D‑term directly and limits achievable gains.",
-      params: [
-        { name: FIRMWARES[firmware].notchEnable, value: "1" },
-        { name: FIRMWARES[firmware].notchFreq, value: "120 Hz" },
-        { name: FIRMWARES[firmware].notchBW, value: "60 Hz" },
-      ],
-    },
-    {
-      severity: "WARNING",
-      title: "High Overshoot",
-      body: "PID loop is aggressive.",
-      params: [
-        { name: FIRMWARES[firmware].rateP, value: "Reduce 5–10%" },
-      ],
-    },
-  ];
+  const report = buildDemoReport(firmware);
 
   return (
     <div style={{
       background: "#020617",
       minHeight: "100vh",
       color: "#e5e7eb",
+      padding: 20,
       maxWidth: 720,
       margin: "0 auto",
     }}>
-      <SummaryHeader severity={severity} />
+      <h1>PID Analyzer — Step 16 (Export)</h1>
 
-      <div style={{ padding: 16 }}>
-        <input
-          type="file"
-          accept=".csv"
-          onChange={e => parseCSV(e.target.files[0], setData, console.error)}
-          style={{ width: "100%" }}
-        />
-
-        {/* Firmware selector */}
+      <label>
+        Firmware:&nbsp;
         <select
           value={firmware}
           onChange={e => setFirmware(e.target.value)}
-          style={{ width: "100%", marginTop: 10 }}
         >
           {Object.keys(FIRMWARES).map(f => (
             <option key={f}>{f}</option>
           ))}
         </select>
+      </label>
 
-        {/* Axis selector */}
-        <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-          {AXES.map(a => (
-            <button
-              key={a.key}
-              onClick={() => setAxis(a.key)}
-              style={{
-                flex: 1,
-                padding: 10,
-                background: axis === a.key ? "#334155" : "#020617",
-                color: "#e5e7eb",
-                border: "1px solid #334155",
-                borderRadius: 6,
-              }}
-            >
-              {a.label}
-            </button>
-          ))}
-        </div>
+      <div style={{ marginTop: 20 }}>
+        <button
+          onClick={() => downloadJSON(report, "pid-tuning-report.json")}
+          style={{ marginRight: 10 }}
+        >
+          Export JSON
+        </button>
 
-        {/* Cards */}
-        <div style={{ marginTop: 16 }}>
-          {cards.map((c, i) => (
-            <Card key={i} {...c} />
-          ))}
-        </div>
+        <button onClick={() => exportPDF(report)}>
+          Export PDF
+        </button>
       </div>
+
+      <pre style={{
+        marginTop: 20,
+        background: "#020617",
+        border: "1px solid #334155",
+        padding: 12,
+        borderRadius: 6,
+        fontSize: 12,
+        overflowX: "auto",
+      }}>
+        {JSON.stringify(report, null, 2)}
+      </pre>
     </div>
   );
 }
+``
