@@ -5,7 +5,7 @@ const AXES = ["roll", "pitch", "yaw"];
 const SEVERITY_ORDER = { OK: 0, WARNING: 1, CRITICAL: 2 };
 const PRESET_KEY = "pid-analyzer-presets";
 
-/* ================= STORAGE HELPERS ================= */
+/* ================= STORAGE ================= */
 function loadPresets() {
   try {
     return JSON.parse(localStorage.getItem(PRESET_KEY)) || [];
@@ -13,30 +13,28 @@ function loadPresets() {
     return [];
   }
 }
-
 function savePresets(presets) {
   localStorage.setItem(PRESET_KEY, JSON.stringify(presets));
 }
 
-/* ================= URL HELPERS (STEP 18) ================= */
-function encodeReport(report) {
-  return btoa(encodeURIComponent(JSON.stringify(report)));
+/* ================= URL (Step 18) ================= */
+function encodeReport(r) {
+  return btoa(encodeURIComponent(JSON.stringify(r)));
 }
-
-function decodeReport(hash) {
+function decodeReport(h) {
   try {
-    return JSON.parse(decodeURIComponent(atob(hash)));
+    return JSON.parse(decodeURIComponent(atob(h)));
   } catch {
     return null;
   }
 }
 
-/* ================= CSV PARSER ================= */
-function parseCSV(file, onSuccess, onError) {
-  const r = new FileReader();
-  r.onload = () => {
+/* ================= CSV ================= */
+function parseCSV(file, ok, err) {
+  const fr = new FileReader();
+  fr.onload = () => {
     try {
-      const lines = String(r.result).split(/\r?\n/).filter(Boolean);
+      const lines = String(fr.result).split(/\r?\n/).filter(Boolean);
       const delim = lines[0].includes(";")
         ? ";"
         : lines[0].includes("\t")
@@ -52,18 +50,18 @@ function parseCSV(file, onSuccess, onError) {
         AXES.forEach((a, i) => {
           row[a] = {
             gyro: +p[idx(`gyro[${i}]`)],
-            set: +p[idx(`setpoint[${i}]`)]
+            set: +p[idx(`setpoint[${i}]`)],
           };
         });
         return row;
       }).filter(r => !isNaN(r.time));
 
-      onSuccess(data);
+      ok(data);
     } catch (e) {
-      onError(e.message);
+      err(e.message);
     }
   };
-  r.readAsText(file);
+  fr.readAsText(file);
 }
 
 /* ================= ANALYSIS ================= */
@@ -106,38 +104,29 @@ function analyze(data) {
 
 /* ================= APP ================= */
 export default function App() {
-  const [data, setData] = useState(null);
   const [report, setReport] = useState(null);
   const [presets, setPresets] = useState(loadPresets());
   const [presetName, setPresetName] = useState("");
+  const [printMode, setPrintMode] = useState(false);
   const [error, setError] = useState("");
 
-  /* Restore from URL (Step 18) */
+  /* Restore from URL */
   useEffect(() => {
     if (window.location.hash.length > 1) {
-      const decoded = decodeReport(window.location.hash.slice(1));
-      if (decoded) setReport(decoded);
+      const r = decodeReport(window.location.hash.slice(1));
+      if (r) setReport(r);
     }
   }, []);
 
-  /* Update URL when report changes */
   useEffect(() => {
     if (report) {
       window.location.hash = encodeReport(report);
     }
   }, [report]);
 
-  /* Save preset */
   function savePreset() {
     if (!presetName || !report) return;
-    const next = [
-      ...presets,
-      {
-        id: Date.now(),
-        name: presetName,
-        report,
-      },
-    ];
+    const next = [...presets, { id: Date.now(), name: presetName, report }];
     setPresets(next);
     savePresets(next);
     setPresetName("");
@@ -147,52 +136,63 @@ export default function App() {
     setReport(p.report);
   }
 
-  function deletePreset(id) {
-    const next = presets.filter(p => p.id !== id);
-    setPresets(next);
-    savePresets(next);
+  function enterPrint() {
+    setPrintMode(true);
+    setTimeout(() => window.print(), 50);
+  }
+
+  function exitPrint() {
+    setPrintMode(false);
   }
 
   return (
-    <div style={{ padding: 20, maxWidth: 860, margin: "auto" }}>
-      <h1>PID Analyzer — Step 19 (Presets)</h1>
-
-      <input
-        type="file"
-        accept=".csv"
-        onChange={e =>
-          parseCSV(
-            e.target.files[0],
-            d => {
-              setData(d);
-              setReport(analyze(d));
-            },
-            setError
-          )
+    <div className={printMode ? "print" : ""} style={{ padding: 20, maxWidth: 900, margin: "auto" }}>
+      <style>{`
+        @media print {
+          body { background: white; color: black; }
+          button, input { display: none !important; }
+          .no-print { display: none !important; }
         }
-      />
+      `}</style>
+
+      {!printMode && <h1>PID Analyzer — Step 20 (Print View)</h1>}
+      {printMode && <h1>PID Tuning Report</h1>}
+
+      {!printMode && (
+        <input
+          type="file"
+          accept=".csv"
+          onChange={e =>
+            parseCSV(
+              e.target.files[0],
+              d => setReport(analyze(d)),
+              setError
+            )
+          }
+        />
+      )}
 
       {error && <div style={{ color: "red" }}>{error}</div>}
 
       {report && (
         <>
+          <p><b>Generated:</b> {new Date(report.generatedAt).toLocaleString()}</p>
+
           <h2>
             Global Status:{" "}
-            <span
-              style={{
-                color:
-                  report.global === "CRITICAL"
-                    ? "red"
-                    : report.global === "WARNING"
-                    ? "orange"
-                    : "green"
-              }}
-            >
+            <span style={{
+              color:
+                report.global === "CRITICAL"
+                  ? "red"
+                  : report.global === "WARNING"
+                  ? "orange"
+                  : "green"
+            }}>
               {report.global}
             </span>
           </h2>
 
-          <table border="1" cellPadding="6">
+          <table border="1" cellPadding="6" width="100%">
             <thead>
               <tr>
                 <th>Axis</th>
@@ -211,45 +211,48 @@ export default function App() {
             </tbody>
           </table>
 
-          {/* Save preset */}
-          <div style={{ marginTop: 12 }}>
-            <input
-              placeholder="Preset name (e.g. Roll tune v2)"
-              value={presetName}
-              onChange={e => setPresetName(e.target.value)}
-            />
-            <button onClick={savePreset} style={{ marginLeft: 8 }}>
-              Save Preset
-            </button>
-          </div>
-        </>
-      )}
-
-      {/* Presets */}
-      {presets.length > 0 && (
-        <>
-          <h3 style={{ marginTop: 20 }}>Saved Presets</h3>
-          <ul>
-            {presets.map(p => (
-              <li key={p.id}>
-                <b>{p.name}</b>{" "}
-                <button onClick={() => loadPreset(p)}>Load</button>
-                <button
-                  onClick={() => deletePreset(p.id)}
-                  style={{ marginLeft: 6 }}
-                >
-                  Delete
+          {!printMode && (
+            <>
+              <div style={{ marginTop: 12 }}>
+                <input
+                  placeholder="Preset name"
+                  value={presetName}
+                  onChange={e => setPresetName(e.target.value)}
+                />
+                <button onClick={savePreset}>Save Preset</button>
+                <button onClick={enterPrint} style={{ marginLeft: 8 }}>
+                  Print / Save PDF
                 </button>
-              </li>
-            ))}
-          </ul>
+              </div>
+
+              {presets.length > 0 && (
+                <>
+                  <h3>Saved Presets</h3>
+                  <ul>
+                    {presets.map(p => (
+                      <li key={p.id}>
+                        <b>{p.name}</b>{" "}
+                        <button onClick={() => loadPreset(p)}>Load</button>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </>
+          )}
+
+          {printMode && (
+            <p style={{ marginTop: 20 }}>
+              © PID Analyzer — Generated automatically
+            </p>
+          )}
         </>
       )}
 
-      {report && (
-        <p style={{ marginTop: 12 }}>
-          🔗 This report is encoded in the URL — copy the link to share it.
-        </p>
+      {printMode && (
+        <button className="no-print" onClick={exitPrint}>
+          Exit Print Mode
+        </button>
       )}
     </div>
   );
