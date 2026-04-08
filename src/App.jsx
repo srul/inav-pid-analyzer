@@ -121,7 +121,7 @@ function analyzeCSV(file) {
   const out = {};
 
   AXES.forEach((a, i) => {
-    if (!cols.gyro[i] || !cols.set[i]) return;
+    if (cols.gyro[i] == null || cols.set[i] == null) return;
 
     const gy = rows.map((r) => r[cols.gyro[i]]).filter(isNum);
     const sp = rows.map((r) => r[cols.set[i]]).filter(isNum);
@@ -141,6 +141,15 @@ function analyzeCSV(file) {
 
   return out;
 }
+
+
+useEffect(() => {
+  if (data) {
+    const firstAxis = AXES.find(a => data[a.key]);
+    if (firstAxis) setAxis(firstAxis.key);
+  }
+}, [data]);
+
 
 /* ====================== APP ====================== */
 
