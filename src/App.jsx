@@ -18,7 +18,7 @@ function parseCSV(file, ok, err) {
       const l = String(r.result).split(/\r?\n/).filter(Boolean);
       let d = ",";
       if (l[0].includes("\t")) d = "\t";
-      if (l[0].includes(";")) d = ";";
+      else if (l[0].includes(";")) d = ";";
 
       const h = l[0].split(d);
       const ti = h.indexOf("time");
@@ -35,15 +35,17 @@ function parseCSV(file, ok, err) {
         throw new Error("Missing required columns");
 
       ok(
-        l.slice(1).map(r => {
-          const p = r.split(d);
-          return {
-            time: +p[ti],
-            roll: { gyro: +p[g.roll], set: +p[g.rollSp] },
-            pitch: { gyro: +p[g.pitch], set: +p[g.pitchSp] },
-            yaw: { gyro: +p[g.yaw], set: +p[g.yawSp] },
-          };
-        }).filter(r => !isNaN(r.time))
+        l.slice(1)
+          .map(r => {
+            const p = r.split(d);
+            return {
+              time: +p[ti],
+              roll: { gyro: +p[g.roll], set: +p[g.rollSp] },
+              pitch: { gyro: +p[g.pitch], set: +p[g.pitchSp] },
+              yaw: { gyro: +p[g.yaw], set: +p[g.yawSp] },
+            };
+          })
+          .filter(r => !isNaN(r.time))
       );
     } catch (e) {
       err(e.message);
@@ -97,69 +99,68 @@ function fft(sig, fs) {
   });
 }
 
-/* ================= STEP 12: FIRMWARE MAPPING ================= */
-function buildCards(m, vibHz) {
+/* ================= STEP 13 RULE ENGINE ================= */
+function buildCardsAndSeverity(m, vibHz) {
   if (m.inactive) {
-    return [{
+    return {
       severity: "OK",
-      title: "No Control Activity",
-      body: "This axis has no meaningful setpoint movement.",
-    }];
+      cards: [{
+        severity: "OK",
+        title: "Inactive Axis",
+        body: "No meaningful setpoint activity detected.",
+      }],
+    };
   }
 
   const cards = [];
+  let globalSeverity = "OK";
 
   if (vibHz > 80) {
-    const bw = vibHz * 0.5;
     cards.push({
       severity: "CRITICAL",
       title: "Enable Harmonic Notch Filter",
       body:
-        "Sharp vibration peaks detected. Motor noise is entering the D‑term and limiting achievable gains.",
+        `Strong vibration detected at ~${vibHz.toFixed(1)} Hz. ` +
+        "Motor noise enters D‑term and limits achievable gains.",
       params: [
-        { name: "INS_HNTCH_ENABLE", value: "1" },
-        { name: "INS_HNTCH_MODE", value: "4 (FFT driven)" },
-        { name: "INS_HNTCH_FREQ", value: vibHz.toFixed(1) },
-        { name: "INS_HNTCH_BW", value: bw.toFixed(1) },
-        { name: "INS_HNTCH_ATT", value: "40 dB" },
+        "INS_HNTCH_ENABLE = 1",
+        "INS_HNTCH_MODE = 4 (FFT)",
+        `INS_HNTCH_FREQ ≈ ${vibHz.toFixed(1)}`,
+        `INS_HNTCH_BW ≈ ${(vibHz * 0.5).toFixed(1)}`,
       ],
     });
+    globalSeverity = "CRITICAL";
   }
 
   if (m.overshoot > 15) {
     cards.push({
       severity: "WARNING",
       title: "High Overshoot",
-      body:
-        "The controller response is aggressive and overshoots the target.",
-      params: [
-        { name: "Rate P", value: "Reduce ~5–10%" },
-      ],
+      body: "Aggressive response with excessive overshoot.",
+      params: ["Reduce Rate P by ~5–10%"],
     });
+    if (globalSeverity !== "CRITICAL") globalSeverity = "WARNING";
   }
 
   if (Math.abs(m.sse) > 0.05) {
     cards.push({
       severity: "WARNING",
       title: "Steady‑State Error",
-      body:
-        "Controller does not fully converge to target.",
-      params: [
-        { name: "Rate I", value: "Increase slowly" },
-      ],
+      body: "Controller does not converge perfectly.",
+      params: ["Increase Rate I slowly"],
     });
+    if (globalSeverity !== "CRITICAL") globalSeverity = "WARNING";
   }
 
   if (!cards.length) {
     cards.push({
       severity: "OK",
       title: "Tune Looks Balanced",
-      body:
-        "No critical issues detected. Current PID configuration appears reasonable.",
+      body: "No critical PID issues detected.",
     });
   }
 
-  return cards;
+  return { severity: globalSeverity, cards };
 }
 
 /* ================= UI ================= */
@@ -183,16 +184,11 @@ function Card({ severity, title, body, params }) {
       <div style={{ color: "#9ca3af", marginTop: 6 }}>{body}</div>
 
       {params && (
-        <table style={{ marginTop: 8, width: "100%", color: "#e5e7eb" }}>
-          <tbody>
-            {params.map((p, i) => (
-              <tr key={i}>
-                <td style={{ fontFamily: "monospace" }}>{p.name}</td>
-                <td style={{ textAlign: "right" }}>{p.value}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <ul style={{ marginTop: 8 }}>
+          {params.map((p, i) => (
+            <li key={i} style={{ fontFamily: "monospace" }}>{p}</li>
+          ))}
+        </ul>
       )}
     </div>
   );
@@ -204,24 +200,39 @@ export default function App() {
   const [axis, setAxis] = useState("roll");
   const [err, setErr] = useState("");
 
-  const m = data && computeMetrics(data, axis);
-
-  const vib =
+  const axisResults =
     data &&
-    (() => {
-      const t = data.slice(-FFT_SAMPLES);
-      if (t.length < FFT_SAMPLES) return 0;
-      const fs = 1 / (t[1].time - t[0].time);
-      return fft(t.map(r => r[axis].gyro), fs)
-        .filter(p => p.f > MIN_VIB_FREQ)
-        .reduce((a, b) => b.m > a.m ? b : a, { f: 0 }).f;
-    })();
+    Object.fromEntries(
+      AXES.map(a => {
+        const m = computeMetrics(data, a.key);
+        let vib = 0;
 
-  const cards = m && buildCards(m, vib);
+        if (!m.inactive) {
+          const t = data.slice(-FFT_SAMPLES);
+          if (t.length >= FFT_SAMPLES) {
+            const fs = 1 / (t[1].time - t[0].time);
+            vib = fft(t.map(r => r[a.key].gyro), fs)
+              .filter(p => p.f > MIN_VIB_FREQ)
+              .reduce((x, y) => y.m > x.m ? y : x, { f: 0 }).f;
+          }
+        }
+
+        const res = buildCardsAndSeverity(m, vib);
+        return [a.key, res];
+      })
+    );
+
+  const globalSeverity =
+    axisResults &&
+    Object.values(axisResults).some(r => r.severity === "CRITICAL")
+      ? "CRITICAL"
+      : Object.values(axisResults).some(r => r.severity === "WARNING")
+        ? "WARNING"
+        : "OK";
 
   return (
     <div style={{ padding: 20, background: "#020617", minHeight: "100vh" }}>
-      <h1 style={{ color: "#e5e7eb" }}>PID Analyzer — Step 12</h1>
+      <h1 style={{ color: "#e5e7eb" }}>PID Analyzer — Step 13</h1>
 
       <input
         type="file"
@@ -229,29 +240,78 @@ export default function App() {
         onChange={e => parseCSV(e.target.files[0], setData, setErr)}
       />
 
-      <div style={{ marginTop: 10 }}>
-        {AXES.map(a => (
-          <button
-            key={a.key}
-            onClick={() => setAxis(a.key)}
-            style={{
-              marginRight: 6,
-              background: axis === a.key ? "#334155" : "#020617",
-              color: "#e5e7eb",
-            }}
-          >
-            {a.label}
-          </button>
-        ))}
-      </div>
-
       {err && <div style={{ color: "#dc2626" }}>{err}</div>}
 
-      {cards && (
-        <div style={{ marginTop: 20 }}>
-          {cards.map((c, i) => <Card key={i} {...c} />)}
-        </div>
+      {axisResults && (
+        <>
+          {/* SUMMARY */}
+          <div style={{
+            marginTop: 20,
+            padding: 16,
+            background: "#020617",
+            border: "1px solid #334155",
+            borderRadius: 6,
+          }}>
+            <h2 style={{
+              color:
+                globalSeverity === "CRITICAL" ? "#dc2626" :
+                globalSeverity === "WARNING" ? "#f59e0b" :
+                "#16a34a",
+            }}>
+              {globalSeverity === "CRITICAL"
+                ? "Tune Needs Attention"
+                : globalSeverity === "WARNING"
+                  ? "Tune Has Warnings"
+                  : "Tune Looks Good"}
+            </h2>
+
+            <div style={{ marginTop: 8 }}>
+              {AXES.map(a => (
+                <span key={a.key}
+                  style={{
+                    marginRight: 12,
+                    padding: "4px 8px",
+                    borderRadius: 4,
+                    background:
+                      axisResults[a.key].severity === "CRITICAL"
+                        ? "#dc2626"
+                        : axisResults[a.key].severity === "WARNING"
+                          ? "#f59e0b"
+                          : "#16a34a",
+                    color: "#020617",
+                  }}>
+                  {a.label}: {axisResults[a.key].severity}
+                </span>
+              ))}
+            </div>
+          </div>
+
+          {/* AXIS SELECT */}
+          <div style={{ marginTop: 14 }}>
+            {AXES.map(a => (
+              <button
+                key={a.key}
+                onClick={() => setAxis(a.key)}
+                style={{
+                  marginRight: 6,
+                  background: axis === a.key ? "#334155" : "#020617",
+                  color: "#e5e7eb",
+                }}
+              >
+                {a.label}
+              </button>
+            ))}
+          </div>
+
+          {/* CARDS */}
+          <div style={{ marginTop: 20 }}>
+            {axisResults[axis].cards.map((c, i) => (
+              <Card key={i} {...c} />
+            ))}
+          </div>
+        </>
       )}
     </div>
   );
 }
+``
