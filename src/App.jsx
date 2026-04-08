@@ -2,11 +2,17 @@ import { useState } from "react";
 import Plot from "react-plotly.js";
 
 export default function App() {
+  const [fileInfo, setFileInfo] = useState(null);
   const [rows, setRows] = useState([]);
+  const [headers, setHeaders] = useState([]);
   const [error, setError] = useState("");
 
   function loadFile(e) {
     setError("");
+    setRows([]);
+    setHeaders([]);
+    setFileInfo(null);
+
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -16,38 +22,48 @@ export default function App() {
         const text = String(reader.result);
         const lines = text.split(/\r?\n/).filter(l => l.trim().length);
 
-        // Detect delimiter
-        const headerLine = lines[0];
+        if (lines.length === 0) {
+          throw new Error("File is empty");
+        }
+
+        // delimiter detection
         let delimiter = ",";
-        if (headerLine.includes("\t")) delimiter = "\t";
-        else if (headerLine.includes(";")) delimiter = ";";
+        if (lines[0].includes("\t")) delimiter = "\t";
+        else if (lines[0].includes(";")) delimiter = ";";
 
-        const headers = headerLine.split(delimiter).map(h => h.trim());
+        const hdrs = lines[0].split(delimiter).map(h => h.trim());
+        setHeaders(hdrs);
 
-        const timeIdx = headers.indexOf("time");
-        const gyroIdx = headers.indexOf("gyro[0]");
+        const timeIdx = hdrs.indexOf("time");
+        const gyroIdx = hdrs.indexOf("gyro[0]");
 
         if (timeIdx === -1 || gyroIdx === -1) {
           throw new Error(
-            'CSV must contain columns "time" and "gyro[0]"'
+            `Missing required columns. Found headers: ${hdrs.join(", ")}`
           );
         }
 
-        const data = lines.slice(1).map(line => {
+        const parsed = lines.slice(1).map((line, i) => {
           const parts = line.split(delimiter);
           return {
             time: Number(parts[timeIdx]),
             gyro: Number(parts[gyroIdx])
           };
-        }).filter(r => Number.isFinite(r.time) && Number.isFinite(r.gyro));
+        }).filter(r =>
+          Number.isFinite(r.time) && Number.isFinite(r.gyro)
+        );
 
-        if (data.length === 0) {
-          throw new Error("No numeric data rows found");
+        if (parsed.length === 0) {
+          throw new Error("No valid numeric rows after parsing");
         }
 
-        setRows(data);
+        setFileInfo({
+          name: file.name,
+          size: file.size,
+          lines: lines.length
+        });
+        setRows(parsed);
       } catch (err) {
-        setRows([]);
         setError(err.message);
       }
     };
@@ -57,37 +73,67 @@ export default function App() {
 
   return (
     <div style={{ padding: 20 }}>
-      <h1>PID Analyzer — Step 1 (Baseline Plot)</h1>
+      <h1>PID Analyzer — Step 1 DEBUG</h1>
+
+      <p style={{ color: "#555" }}>
+        This page must always show text after file selection.
+      </p>
 
       <input type="file" accept=".csv,.txt" onChange={loadFile} />
 
       {error && (
-        <div style={{ color: "red", marginTop: 10 }}>
-          ❌ {error}
+        <div style={{ marginTop: 12, color: "red", whiteSpace: "pre-wrap" }}>
+          ❌ ERROR: {error}
         </div>
       )}
 
-      {rows.length > 0 && (
-        <div style={{ marginTop: 20 }}>
-          <Plot
-            data={[
-              {
-                x: rows.map(r => r.time),
-                y: rows.map(r => r.gyro),
-                type: "scatter",
-                mode: "lines",
-                name: "gyro[0]"
-              }
-            ]}
-            layout={{
-              title: "Gyro[0] vs Time",
-              xaxis: { title: "Time (s)" },
-              yaxis: { title: "Gyro rate" },
-              height: 400
-            }}
-            style={{ width: "100%" }}
-          />
+      {fileInfo && (
+        <div style={{ marginTop: 12 }}>
+          <b>File:</b> {fileInfo.name}<br />
+          <b>Size:</b> {fileInfo.size} bytes<br />
+          <b>Total lines:</b> {fileInfo.lines}
         </div>
+      )}
+
+      {headers.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <b>Headers:</b>
+          <pre>{JSON.stringify(headers, null, 2)}</pre>
+        </div>
+      )}
+
+      <div style={{ marginTop: 12 }}>
+        <b>Parsed rows:</b> {rows.length}
+      </div>
+
+      {rows.length > 0 && (
+        <>
+          <div style={{ marginTop: 12 }}>
+            <b>First row:</b>
+            <pre>{JSON.stringify(rows[0], null, 2)}</pre>
+          </div>
+
+          <div style={{ marginTop: 20 }}>
+            <Plot
+              data={[
+                {
+                  x: rows.map(r => r.time),
+                  y: rows.map(r => r.gyro),
+                  type: "scatter",
+                  mode: "lines",
+                  name: "gyro[0]"
+                }
+              ]}
+              layout={{
+                title: "Gyro[0] vs Time",
+                xaxis: { title: "Time" },
+                yaxis: { title: "Gyro" },
+                height: 400
+              }}
+              style={{ width: "100%" }}
+            />
+          </div>
+        </>
       )}
     </div>
   );
