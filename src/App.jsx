@@ -11,7 +11,7 @@ const FFT_SAMPLES = 512;
 const MIN_VIB_FREQ = 20;
 
 /* ================= CSV ================= */
-function parseCSV(file, onSuccess, onError) {
+function parseCSV(file, ok, err) {
   const r = new FileReader();
   r.onload = () => {
     try {
@@ -21,7 +21,7 @@ function parseCSV(file, onSuccess, onError) {
       if (l[0].includes(";")) d = ";";
 
       const h = l[0].split(d);
-      const t = h.indexOf("time");
+      const ti = h.indexOf("time");
       const g = {
         roll: h.indexOf("gyro[0]"),
         pitch: h.indexOf("gyro[1]"),
@@ -30,38 +30,39 @@ function parseCSV(file, onSuccess, onError) {
         pitchSp: h.indexOf("setpoint[1]"),
         yawSp: h.indexOf("setpoint[2]"),
       };
-      if (t < 0 || Object.values(g).some(v => v < 0))
+
+      if (ti < 0 || Object.values(g).some(v => v < 0))
         throw new Error("Missing required columns");
 
-      const data = l.slice(1).map(r => {
-        const p = r.split(d);
-        return {
-          time: +p[t],
-          roll: { gyro: +p[g.roll], set: +p[g.rollSp] },
-          pitch: { gyro: +p[g.pitch], set: +p[g.pitchSp] },
-          yaw: { gyro: +p[g.yaw], set: +p[g.yawSp] },
-        };
-      }).filter(r => !isNaN(r.time));
-
-      onSuccess(data);
+      ok(
+        l.slice(1).map(r => {
+          const p = r.split(d);
+          return {
+            time: +p[ti],
+            roll: { gyro: +p[g.roll], set: +p[g.rollSp] },
+            pitch: { gyro: +p[g.pitch], set: +p[g.pitchSp] },
+            yaw: { gyro: +p[g.yaw], set: +p[g.yawSp] },
+          };
+        }).filter(r => !isNaN(r.time))
+      );
     } catch (e) {
-      onError(e.message);
+      err(e.message);
     }
   };
   r.readAsText(file);
 }
 
 /* ================= METRICS ================= */
-function metrics(data, a) {
-  const g = data.map(r => r[a].gyro);
-  const s = data.map(r => r[a].set);
-  const t = data.map(r => r.time);
+function computeMetrics(d, a) {
+  const g = d.map(r => r[a].gyro);
+  const s = d.map(r => r[a].set);
+  const t = d.map(r => r.time);
   const fs = s.at(-1);
 
   if (Math.abs(fs) < 1e-6) return { inactive: true };
 
   const peak = Math.max(...g);
-  const over = ((peak - fs) / Math.abs(fs)) * 100;
+  const overshoot = ((peak - fs) / Math.abs(fs)) * 100;
 
   const tail = Math.floor(g.length * 0.9);
   const sse =
@@ -79,7 +80,7 @@ function metrics(data, a) {
       break;
     }
 
-  return { over, sse, settle };
+  return { overshoot, sse, settle };
 }
 
 /* ================= FFT ================= */
@@ -96,86 +97,102 @@ function fft(sig, fs) {
   });
 }
 
-/* ================= STEP 11 CARDS ================= */
-function buildRecommendationCards(m, vibHz) {
+/* ================= STEP 12: FIRMWARE MAPPING ================= */
+function buildCards(m, vibHz) {
   if (m.inactive) {
     return [{
       severity: "OK",
-      title: "No Control Activity Detected",
-      body:
-        "No significant setpoint change on this axis. PID tuning advice is not applicable.",
+      title: "No Control Activity",
+      body: "This axis has no meaningful setpoint movement.",
     }];
   }
 
   const cards = [];
 
   if (vibHz > 80) {
+    const bw = vibHz * 0.5;
     cards.push({
       severity: "CRITICAL",
       title: "Enable Harmonic Notch Filter",
       body:
-        `Strong vibration detected at ~${vibHz.toFixed(1)} Hz. ` +
-        "Motor noise is entering the control loop and limiting achievable gains.",
+        "Sharp vibration peaks detected. Motor noise is entering the D‑term and limiting achievable gains.",
       params: [
-        "Set notch center frequency",
-        "Configure bandwidth ~½ of frequency",
-        "Apply before PID changes",
+        { name: "INS_HNTCH_ENABLE", value: "1" },
+        { name: "INS_HNTCH_MODE", value: "4 (FFT driven)" },
+        { name: "INS_HNTCH_FREQ", value: vibHz.toFixed(1) },
+        { name: "INS_HNTCH_BW", value: bw.toFixed(1) },
+        { name: "INS_HNTCH_ATT", value: "40 dB" },
       ],
     });
   }
 
-  if (m.over > 15)
+  if (m.overshoot > 15) {
     cards.push({
       severity: "WARNING",
       title: "High Overshoot",
       body:
-        "System response is aggressive and overshoots the target.",
-      params: ["Reduce P slightly (5–10%)"],
+        "The controller response is aggressive and overshoots the target.",
+      params: [
+        { name: "Rate P", value: "Reduce ~5–10%" },
+      ],
     });
+  }
 
-  if (Math.abs(m.sse) > 0.05)
+  if (Math.abs(m.sse) > 0.05) {
     cards.push({
       severity: "WARNING",
-      title: "Steady-State Error Detected",
+      title: "Steady‑State Error",
       body:
-        "Controller does not fully converge to the target.",
-      params: ["Increase I slowly"],
+        "Controller does not fully converge to target.",
+      params: [
+        { name: "Rate I", value: "Increase slowly" },
+      ],
     });
+  }
 
-  if (!cards.length)
+  if (!cards.length) {
     cards.push({
       severity: "OK",
-      title: "PID Tune Looks Balanced",
+      title: "Tune Looks Balanced",
       body:
-        "No critical issues detected. Current tuning appears reasonable.",
+        "No critical issues detected. Current PID configuration appears reasonable.",
     });
+  }
 
   return cards;
 }
 
-/* ================= UI CARD ================= */
+/* ================= UI ================= */
 function Card({ severity, title, body, params }) {
-  const color =
-    severity === "CRITICAL" ? "#e53935" :
-    severity === "WARNING" ? "#ffa726" :
-    "#43a047";
+  const c =
+    severity === "CRITICAL" ? "#dc2626" :
+    severity === "WARNING" ? "#f59e0b" :
+    "#16a34a";
 
   return (
     <div style={{
-      borderLeft: `6px solid ${color}`,
-      background: "#111827",
+      borderLeft: `6px solid ${c}`,
+      background: "#020617",
       color: "#e5e7eb",
       padding: 14,
       marginBottom: 12,
       borderRadius: 6,
     }}>
-      <b style={{ color }}>{severity}</b>
+      <b style={{ color: c }}>{severity}</b>
       <div style={{ fontSize: 16, marginTop: 6 }}>{title}</div>
       <div style={{ color: "#9ca3af", marginTop: 6 }}>{body}</div>
+
       {params && (
-        <ul style={{ marginTop: 8 }}>
-          {params.map((p, i) => <li key={i}>{p}</li>)}
-        </ul>
+        <table style={{ marginTop: 8, width: "100%", color: "#e5e7eb" }}>
+          <tbody>
+            {params.map((p, i) => (
+              <tr key={i}>
+                <td style={{ fontFamily: "monospace" }}>{p.name}</td>
+                <td style={{ textAlign: "right" }}>{p.value}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       )}
     </div>
   );
@@ -185,9 +202,9 @@ function Card({ severity, title, body, params }) {
 export default function App() {
   const [data, setData] = useState(null);
   const [axis, setAxis] = useState("roll");
-  const [error, setError] = useState("");
+  const [err, setErr] = useState("");
 
-  const m = data && metrics(data, axis);
+  const m = data && computeMetrics(data, axis);
 
   const vib =
     data &&
@@ -200,18 +217,16 @@ export default function App() {
         .reduce((a, b) => b.m > a.m ? b : a, { f: 0 }).f;
     })();
 
-  const cards = m && buildRecommendationCards(m, vib);
+  const cards = m && buildCards(m, vib);
 
   return (
     <div style={{ padding: 20, background: "#020617", minHeight: "100vh" }}>
-      <h1 style={{ color: "#e5e7eb" }}>
-        PID Analyzer — Step 11 (Diagnostics UI)
-      </h1>
+      <h1 style={{ color: "#e5e7eb" }}>PID Analyzer — Step 12</h1>
 
       <input
         type="file"
         accept=".csv"
-        onChange={e => parseCSV(e.target.files[0], setData, setError)}
+        onChange={e => parseCSV(e.target.files[0], setData, setErr)}
       />
 
       <div style={{ marginTop: 10 }}>
@@ -230,7 +245,7 @@ export default function App() {
         ))}
       </div>
 
-      {error && <div style={{ color: "red" }}>{error}</div>}
+      {err && <div style={{ color: "#dc2626" }}>{err}</div>}
 
       {cards && (
         <div style={{ marginTop: 20 }}>
@@ -240,4 +255,3 @@ export default function App() {
     </div>
   );
 }
-``
