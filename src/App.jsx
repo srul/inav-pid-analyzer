@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 
-/* ================= CONFIG ================= */
 const AXES = ["roll", "pitch", "yaw"];
 
 /* ================= CSV ================= */
@@ -41,7 +40,6 @@ function parseCSV(file, onSuccess, onError) {
 /* ================= ANALYSIS ================= */
 function analyze(data) {
   const axes = {};
-  let global = "OK";
 
   AXES.forEach(a => {
     const g = data.map(r => r[a].gyro);
@@ -60,25 +58,33 @@ function analyze(data) {
     if (overshoot > 15) severity = "WARNING";
     if (overshoot > 30) severity = "CRITICAL";
 
-    if (severity === "CRITICAL") global = "CRITICAL";
-    if (severity === "WARNING" && global !== "CRITICAL")
-      global = "WARNING";
-
-    axes[a] = { severity, overshoot: overshoot.toFixed(1) };
+    axes[a] = { severity };
   });
 
-  return { global, axes };
+  return { axes };
 }
 
-/* ================= APP ================= */
 export default function App() {
-  const [data, setData] = useState(null);
   const [report, setReport] = useState(null);
+
+  // ✅ Axis animation state
   const [axis, setAxis] = useState("roll");
-  const [error, setError] = useState("");
+  const [visibleAxis, setVisibleAxis] = useState("roll");
+  const [isExiting, setIsExiting] = useState(false);
+
+  function handleAxisChange(nextAxis) {
+    if (nextAxis === axis) return;
+    setIsExiting(true);
+
+    setTimeout(() => {
+      setAxis(nextAxis);
+      setVisibleAxis(nextAxis);
+      setIsExiting(false);
+    }, 200); // must match CSS exit duration
+  }
 
   return (
-    <div className="app analyzer">
+    <div className="app">
       <style>{`
         body {
           margin: 0;
@@ -88,15 +94,14 @@ export default function App() {
         }
 
         /* ===== Animations ===== */
-        @keyframes fadeSlideIn {
+        @keyframes enter {
           from { opacity: 0; transform: translateY(12px); }
-          to { opacity: 1; transform: translateY(0); }
+          to   { opacity: 1; transform: translateY(0); }
         }
 
-        @keyframes criticalPulse {
-          0% { box-shadow: 0 0 0 rgba(239,68,68,0); }
-          50% { box-shadow: 0 0 18px rgba(239,68,68,0.35); }
-          100% { box-shadow: 0 0 0 rgba(239,68,68,0); }
+        @keyframes exit {
+          from { opacity: 1; transform: translateY(0); }
+          to   { opacity: 0; transform: translateY(12px); }
         }
 
         .top-bar {
@@ -104,14 +109,13 @@ export default function App() {
           font-weight: 600;
           color: #ef4444;
           border-bottom: 2px solid #ef4444;
-          margin-bottom: 16px;
-          animation: fadeSlideIn 200ms ease-out;
+          margin: 16px;
         }
 
         .axis-tabs {
           display: flex;
           gap: 8px;
-          margin-bottom: 16px;
+          margin: 16px;
         }
 
         .axis-tabs button {
@@ -119,8 +123,8 @@ export default function App() {
           padding: 10px;
           background: #020617;
           border: 1px solid #334155;
-          color: #e5e7eb;
           border-radius: 6px;
+          color: #e5e7eb;
           cursor: pointer;
         }
 
@@ -132,21 +136,17 @@ export default function App() {
           background: #020617;
           border-left: 6px solid;
           padding: 16px;
-          margin-bottom: 16px;
+          margin: 16px;
           border-radius: 6px;
-          animation: fadeSlideIn 260ms ease-out both;
+          animation: enter 220ms ease-out forwards;
         }
 
-        .card.CRITICAL {
-          border-color: #ef4444;
-          animation:
-            fadeSlideIn 260ms ease-out both,
-            criticalPulse 2.4s ease-in-out infinite;
+        .card.exit {
+          animation: exit 200ms ease-in forwards;
         }
 
-        .card.WARNING {
-          border-color: #f59e0b;
-        }
+        .CRITICAL { border-color: #ef4444; }
+        .WARNING  { border-color: #f59e0b; }
 
         .card-title {
           font-weight: 600;
@@ -166,19 +166,15 @@ export default function App() {
       <input
         type="file"
         accept=".csv"
+        style={{ marginLeft: 16 }}
         onChange={e =>
           parseCSV(
             e.target.files[0],
-            d => {
-              setData(d);
-              setReport(analyze(d));
-            },
-            setError
+            d => setReport(analyze(d)),
+            console.error
           )
         }
       />
-
-      {error && <div style={{ color: "red" }}>{error}</div>}
 
       {report && (
         <>
@@ -186,33 +182,33 @@ export default function App() {
             {AXES.map(a => (
               <button
                 key={a}
-                className={axis === a ? "active" : ""}
-                onClick={() => setAxis(a)}
+                className={visibleAxis === a ? "active" : ""}
+                onClick={() => handleAxisChange(a)}
               >
                 {a.toUpperCase()}
               </button>
             ))}
           </div>
 
-          {/* === FIXED RENDER LOGIC === */}
+          {/* === ANIMATED CARDS === */}
           {report.axes[axis].severity === "CRITICAL" && (
-            <div className="card CRITICAL">
+            <div className={`card CRITICAL ${isExiting ? "exit" : ""}`}>
               <div className="card-title">CRITICAL</div>
               Enable Harmonic Notch Filter
               <div className="param">
                 <span>gyro_notch1_hz</span>
-                <span>120 Hz</span>
+                <span>120 Hz</span>
               </div>
               <div className="param">
                 <span>gyro_notch1_cutoff</span>
-                <span>60 Hz</span>
+                <span>60 Hz</span>
               </div>
             </div>
           )}
 
           {(report.axes[axis].severity === "CRITICAL" ||
             report.axes[axis].severity === "WARNING") && (
-            <div className="card WARNING">
+            <div className={`card WARNING ${isExiting ? "exit" : ""}`}>
               <div className="card-title">WARNING</div>
               High Overshoot
               <div className="param">
@@ -223,7 +219,7 @@ export default function App() {
           )}
 
           {report.axes[axis].severity === "OK" && (
-            <div className="card">
+            <div className={`card ${isExiting ? "exit" : ""}`}>
               <div className="card-title">OK</div>
               No issues detected on this axis.
             </div>
