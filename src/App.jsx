@@ -1,10 +1,19 @@
-import { useEffect, useState } from "react";
+import { useState, useEffect } from "react";
 
 /* ================= CONFIG ================= */
 const AXES = ["roll", "pitch", "yaw"];
 const SEVERITY_ORDER = { OK: 0, WARNING: 1, CRITICAL: 2 };
 const PRESET_KEY = "pid-analyzer-presets";
 const THEME_KEY = "pid-analyzer-theme";
+
+/* ================= THEME ================= */
+function getInitialTheme() {
+  const saved = localStorage.getItem(THEME_KEY);
+  if (saved) return saved;
+  return window.matchMedia("(prefers-color-scheme: dark)").matches
+    ? "dark"
+    : "light";
+}
 
 /* ================= STORAGE ================= */
 function loadPresets() {
@@ -18,33 +27,24 @@ function savePresets(presets) {
   localStorage.setItem(PRESET_KEY, JSON.stringify(presets));
 }
 
-/* ================= THEME ================= */
-function getInitialTheme() {
-  const saved = localStorage.getItem(THEME_KEY);
-  if (saved) return saved;
-  return window.matchMedia("(prefers-color-scheme: dark)").matches
-    ? "dark"
-    : "light";
+/* ================= URL (Shareable Reports) ================= */
+function encodeReport(report) {
+  return btoa(encodeURIComponent(JSON.stringify(report)));
 }
-
-/* ================= URL (Step 18) ================= */
-function encodeReport(r) {
-  return btoa(encodeURIComponent(JSON.stringify(r)));
-}
-function decodeReport(h) {
+function decodeReport(hash) {
   try {
-    return JSON.parse(decodeURIComponent(atob(h)));
+    return JSON.parse(decodeURIComponent(atob(hash)));
   } catch {
     return null;
   }
 }
 
-/* ================= CSV ================= */
-function parseCSV(file, ok, err) {
-  const fr = new FileReader();
-  fr.onload = () => {
+/* ================= CSV PARSER ================= */
+function parseCSV(file, onSuccess, onError) {
+  const r = new FileReader();
+  r.onload = () => {
     try {
-      const lines = String(fr.result).split(/\r?\n/).filter(Boolean);
+      const lines = String(r.result).split(/\r?\n/).filter(Boolean);
       const delim = lines[0].includes(";")
         ? ";"
         : lines[0].includes("\t")
@@ -66,12 +66,12 @@ function parseCSV(file, ok, err) {
         return row;
       }).filter(r => !isNaN(r.time));
 
-      ok(data);
+      onSuccess(data);
     } catch (e) {
-      err(e.message);
+      onError(e.message);
     }
   };
-  fr.readAsText(file);
+  r.readAsText(file);
 }
 
 /* ================= ANALYSIS ================= */
@@ -117,8 +117,8 @@ export default function App() {
   const [report, setReport] = useState(null);
   const [presets, setPresets] = useState(loadPresets());
   const [presetName, setPresetName] = useState("");
-  const [printMode, setPrintMode] = useState(false);
   const [theme, setTheme] = useState(getInitialTheme());
+  const [printMode, setPrintMode] = useState(false);
   const [error, setError] = useState("");
 
   /* Apply theme */
@@ -135,6 +135,7 @@ export default function App() {
     }
   }, []);
 
+  /* Update URL on change */
   useEffect(() => {
     if (report) {
       window.location.hash = encodeReport(report);
@@ -151,6 +152,12 @@ export default function App() {
 
   function loadPreset(p) {
     setReport(p.report);
+  }
+
+  function deletePreset(id) {
+    const next = presets.filter(p => p.id !== id);
+    setPresets(next);
+    savePresets(next);
   }
 
   function enterPrint() {
@@ -185,37 +192,39 @@ export default function App() {
         }
         table {
           border-collapse: collapse;
+          width: 100%;
         }
         th, td {
           border: 1px solid var(--border);
+          padding: 6px;
         }
         @media print {
           button, input { display: none !important; }
         }
       `}</style>
 
-      <h1>PID Analyzer — Step 21 (Theme Toggle)</h1>
+      <h1>PID Analyzer (Final)</h1>
 
       {!printMode && (
-        <button
-          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-        >
-          {theme === "dark" ? "☀️ Light Mode" : "🌙 Dark Mode"}
-        </button>
-      )}
+        <>
+          <button onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
+            {theme === "dark" ? "☀️ Light Mode" : "🌙 Dark Mode"}
+          </button>
 
-      {!printMode && (
-        <input
-          type="file"
-          accept=".csv"
-          onChange={e =>
-            parseCSV(
-              e.target.files[0],
-              d => setReport(analyze(d)),
-              setError
-            )
-          }
-        />
+          <br /><br />
+
+          <input
+            type="file"
+            accept=".csv"
+            onChange={e =>
+              parseCSV(
+                e.target.files[0],
+                d => setReport(analyze(d)),
+                setError
+              )
+            }
+          />
+        </>
       )}
 
       {error && <div style={{ color: "red" }}>{error}</div>}
@@ -226,21 +235,19 @@ export default function App() {
 
           <h2>
             Global Status:{" "}
-            <span
-              style={{
-                color:
-                  report.global === "CRITICAL"
-                    ? "red"
-                    : report.global === "WARNING"
-                    ? "orange"
-                    : "green"
-              }}
-            >
+            <span style={{
+              color:
+                report.global === "CRITICAL"
+                  ? "red"
+                  : report.global === "WARNING"
+                  ? "orange"
+                  : "green"
+            }}>
               {report.global}
             </span>
           </h2>
 
-          <table cellPadding="6" width="100%">
+          <table>
             <thead>
               <tr>
                 <th>Axis</th>
@@ -261,17 +268,16 @@ export default function App() {
 
           {!printMode && (
             <>
-              <div style={{ marginTop: 12 }}>
-                <input
-                  placeholder="Preset name"
-                  value={presetName}
-                  onChange={e => setPresetName(e.target.value)}
-                />
-                <button onClick={savePreset}>Save Preset</button>
-                <button onClick={enterPrint} style={{ marginLeft: 8 }}>
-                  Print / Save PDF
-                </button>
-              </div>
+              <br />
+              <input
+                placeholder="Preset name"
+                value={presetName}
+                onChange={e => setPresetName(e.target.value)}
+              />
+              <button onClick={savePreset}>Save Preset</button>
+              <button onClick={enterPrint} style={{ marginLeft: 8 }}>
+                Print / Save PDF
+              </button>
 
               {presets.length > 0 && (
                 <>
@@ -281,21 +287,25 @@ export default function App() {
                       <li key={p.id}>
                         <b>{p.name}</b>{" "}
                         <button onClick={() => loadPreset(p)}>Load</button>
+                        <button onClick={() => deletePreset(p.id)}>Delete</button>
                       </li>
                     ))}
                   </ul>
                 </>
               )}
+
+              <p>
+                🔗 This report is encoded in the URL — copy the link to share it.
+              </p>
             </>
           )}
         </>
       )}
 
       {printMode && (
-        <button onClick={exitPrint} style={{ marginTop: 20 }}>
-          Exit Print Mode
-        </button>
+        <button onClick={exitPrint}>Exit Print Mode</button>
       )}
     </div>
   );
 }
+``
