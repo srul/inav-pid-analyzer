@@ -1,18 +1,81 @@
 import { useEffect, useState } from "react";
 
+/* ================= CONFIG ================= */
 const AXES = ["roll", "pitch", "yaw"];
 
-export default function App() {
-  const [axis, setAxis] = useState("roll");
+/* ================= CSV ================= */
+function parseCSV(file, onSuccess, onError) {
+  const r = new FileReader();
+  r.onload = () => {
+    try {
+      const lines = String(r.result).split(/\r?\n/).filter(Boolean);
+      const delim = lines[0].includes(";")
+        ? ";"
+        : lines[0].includes("\t")
+        ? "\t"
+        : ",";
+      const headers = lines[0].split(delim);
+      const idx = h => headers.indexOf(h);
+      const t = idx("time");
 
-  const report = {
-    global: "CRITICAL",
-    axes: {
-      roll: { severity: "CRITICAL" },
-      pitch: { severity: "OK" },
-      yaw: { severity: "OK" },
-    },
+      const data = lines.slice(1).map(l => {
+        const p = l.split(delim);
+        const row = { time: +p[t] };
+        AXES.forEach((a, i) => {
+          row[a] = {
+            gyro: +p[idx(`gyro[${i}]`)],
+            set: +p[idx(`setpoint[${i}]`)],
+          };
+        });
+        return row;
+      }).filter(r => !isNaN(r.time));
+
+      onSuccess(data);
+    } catch (e) {
+      onError(e.message);
+    }
   };
+  r.readAsText(file);
+}
+
+/* ================= ANALYSIS ================= */
+function analyze(data) {
+  const axes = {};
+  let global = "OK";
+
+  AXES.forEach(a => {
+    const g = data.map(r => r[a].gyro);
+    const s = data.map(r => r[a].set);
+    const fs = s.at(-1);
+
+    if (Math.abs(fs) < 1e-6) {
+      axes[a] = { severity: "OK" };
+      return;
+    }
+
+    const peak = Math.max(...g);
+    const overshoot = ((peak - fs) / Math.abs(fs)) * 100;
+
+    let severity = "OK";
+    if (overshoot > 15) severity = "WARNING";
+    if (overshoot > 30) severity = "CRITICAL";
+
+    if (severity === "CRITICAL") global = "CRITICAL";
+    if (severity === "WARNING" && global !== "CRITICAL")
+      global = "WARNING";
+
+    axes[a] = { severity, overshoot: overshoot.toFixed(1) };
+  });
+
+  return { global, axes };
+}
+
+/* ================= APP ================= */
+export default function App() {
+  const [data, setData] = useState(null);
+  const [report, setReport] = useState(null);
+  const [axis, setAxis] = useState("roll");
+  const [error, setError] = useState("");
 
   return (
     <div className="app analyzer">
@@ -36,20 +99,13 @@ export default function App() {
           100% { box-shadow: 0 0 0 rgba(239,68,68,0); }
         }
 
-        @keyframes warningPulse {
-          0% { box-shadow: 0 0 0 rgba(245,158,11,0); }
-          50% { box-shadow: 0 0 14px rgba(245,158,11,0.35); }
-          100% { box-shadow: 0 0 0 rgba(245,158,11,0); }
-        }
-
         .top-bar {
           font-size: 28px;
           font-weight: 600;
           color: #ef4444;
           border-bottom: 2px solid #ef4444;
-          padding-bottom: 8px;
           margin-bottom: 16px;
-          animation: fadeSlideIn 220ms ease-out;
+          animation: fadeSlideIn 200ms ease-out;
         }
 
         .axis-tabs {
@@ -66,16 +122,9 @@ export default function App() {
           color: #e5e7eb;
           border-radius: 6px;
           cursor: pointer;
-          transition: transform 120ms ease, box-shadow 120ms ease;
-        }
-
-        .axis-tabs button:hover {
-          transform: translateY(-1px);
         }
 
         .axis-tabs button.active {
-          transform: scale(1.02);
-          box-shadow: 0 0 12px rgba(148,163,184,0.35);
           background: #334155;
         }
 
@@ -85,21 +134,18 @@ export default function App() {
           padding: 16px;
           margin-bottom: 16px;
           border-radius: 6px;
-          animation: fadeSlideIn 280ms ease-out both;
+          animation: fadeSlideIn 260ms ease-out both;
         }
 
         .card.CRITICAL {
           border-color: #ef4444;
           animation:
-            fadeSlideIn 280ms ease-out both,
+            fadeSlideIn 260ms ease-out both,
             criticalPulse 2.4s ease-in-out infinite;
         }
 
         .card.WARNING {
           border-color: #f59e0b;
-          animation:
-            fadeSlideIn 280ms ease-out both,
-            warningPulse 3s ease-in-out infinite;
         }
 
         .card-title {
@@ -117,39 +163,73 @@ export default function App() {
 
       <div className="top-bar">Tune Needs Attention</div>
 
-      <div className="axis-tabs">
-        {AXES.map(a => (
-          <button
-            key={a}
-            className={axis === a ? "active" : ""}
-            onClick={() => setAxis(a)}
-          >
-            {a.toUpperCase()}
-          </button>
-        ))}
-      </div>
+      <input
+        type="file"
+        accept=".csv"
+        onChange={e =>
+          parseCSV(
+            e.target.files[0],
+            d => {
+              setData(d);
+              setReport(analyze(d));
+            },
+            setError
+          )
+        }
+      />
 
-      <div className="card CRITICAL">
-        <div className="card-title">CRITICAL</div>
-        Enable Harmonic Notch Filter
-        <div className="param">
-          <span>gyro_notch1_hz</span>
-          <span>120 Hz</span>
-        </div>
-        <div className="param">
-          <span>gyro_notch1_cutoff</span>
-          <span>60 Hz</span>
-        </div>
-      </div>
+      {error && <div style={{ color: "red" }}>{error}</div>}
 
-      <div className="card WARNING">
-        <div className="card-title">WARNING</div>
-        High Overshoot
-        <div className="param">
-          <span>roll_p</span>
-          <span>Reduce 5–10%</span>
-        </div>
-      </div>
+      {report && (
+        <>
+          <div className="axis-tabs">
+            {AXES.map(a => (
+              <button
+                key={a}
+                className={axis === a ? "active" : ""}
+                onClick={() => setAxis(a)}
+              >
+                {a.toUpperCase()}
+              </button>
+            ))}
+          </div>
+
+          {/* === FIXED RENDER LOGIC === */}
+          {report.axes[axis].severity === "CRITICAL" && (
+            <div className="card CRITICAL">
+              <div className="card-title">CRITICAL</div>
+              Enable Harmonic Notch Filter
+              <div className="param">
+                <span>gyro_notch1_hz</span>
+                <span>120 Hz</span>
+              </div>
+              <div className="param">
+                <span>gyro_notch1_cutoff</span>
+                <span>60 Hz</span>
+              </div>
+            </div>
+          )}
+
+          {(report.axes[axis].severity === "CRITICAL" ||
+            report.axes[axis].severity === "WARNING") && (
+            <div className="card WARNING">
+              <div className="card-title">WARNING</div>
+              High Overshoot
+              <div className="param">
+                <span>{axis}_p</span>
+                <span>Reduce 5–10%</span>
+              </div>
+            </div>
+          )}
+
+          {report.axes[axis].severity === "OK" && (
+            <div className="card">
+              <div className="card-title">OK</div>
+              No issues detected on this axis.
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }
