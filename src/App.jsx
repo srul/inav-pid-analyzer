@@ -12,27 +12,39 @@ const AXES = [
 
 const isNum = (v) => typeof v === "number" && Number.isFinite(v);
 
-/* ====================== CSV HELPERS ====================== */
+/* ====================== PARSING HELPERS ====================== */
 
-const norm = (h) => String(h ?? "").trim().toLowerCase();
+const norm = (s) => String(s ?? "").trim().toLowerCase();
+
+function detectDelimiter(line) {
+  if (line.includes(",")) return ",";
+  if (line.includes("\t")) return "\t";
+  if (line.includes(";")) return ";";
+  return ",";
+}
 
 function guessColumns(headers) {
   const h = headers.map(norm);
-  const pick = (k) =>
-    headers[h.findIndex((x) => x === k)] ?? null;
+
+  const pick = (names) =>
+    names.map((n) => headers[h.indexOf(n)]).find(Boolean) || null;
 
   return {
-    time: pick("time") || pick("time_us") || headers[0],
-    gyro: [pick("gyro[0]"), pick("gyro[1]"), pick("gyro[2]")],
+    time: pick(["time", "time_us", "timestamp"]) || headers[0],
+    gyro: [
+      pick(["gyro[0]", "gyro_x"]),
+      pick(["gyro[1]", "gyro_y"]),
+      pick(["gyro[2]", "gyro_z"]),
+    ],
     set: [
-      pick("setpoint[0]") || pick("rccommand[0]"),
-      pick("setpoint[1]") || pick("rccommand[1]"),
-      pick("setpoint[2]") || pick("rccommand[2]"),
+      pick(["setpoint[0]", "rccommand[0]"]),
+      pick(["setpoint[1]", "rccommand[1]"]),
+      pick(["setpoint[2]", "rccommand[2]"]),
     ],
   };
 }
 
-/* ====================== UTILS ====================== */
+/* ====================== NUMERICS ====================== */
 
 function rms(arr) {
   const v = arr.filter(isNum);
@@ -40,7 +52,7 @@ function rms(arr) {
   return Math.sqrt(v.reduce((a, b) => a + b * b, 0) / v.length);
 }
 
-/* ====================== TIME‑DOMAIN METRICS ====================== */
+/* ====================== METRICS ====================== */
 
 function stepResponseMetrics(sp, gy) {
   const n = Math.min(sp.length, gy.length);
@@ -100,113 +112,30 @@ function computeTuneScore(m) {
   return Math.max(0, Math.min(100, Math.round(s)));
 }
 
-/* ====================== FFT ====================== */
-
-// radix‑2 FFT magnitude
-function fftMagnitude(signal) {
-  const N = signal.length;
-  if (N & (N - 1)) return null;
-
-  const real = signal.slice();
-  const imag = new Array(N).fill(0);
-
-  for (let len = 2; len <= N; len <<= 1) {
-    const ang = (-2 * Math.PI) / len;
-    for (let i = 0; i < N; i += len) {
-      for (let j = 0; j < len / 2; j++) {
-        const wr = Math.cos(ang * j);
-        const wi = Math.sin(ang * j);
-        const r = real[i + j + len / 2];
-        const im = imag[i + j + len / 2];
-
-        const tr = wr * r - wi * im;
-        const ti = wr * im + wi * r;
-
-        real[i + j + len / 2] = real[i + j] - tr;
-        imag[i + j + len / 2] = imag[i + j] - ti;
-        real[i + j] += tr;
-        imag[i + j] += ti;
-      }
-    }
-  }
-
-  return real.slice(0, N / 2).map((r, i) =>
-    Math.sqrt(r * r + imag[i] * imag[i])
-  );
-}
-
-function computeFFT(signal, sampleRateHz = 1000) {
-  const N = 2048;
-  if (signal.length < N) return null;
-
-  const slice = signal.slice(-N);
-  const windowed = slice.map(
-    (v, i) => v * (0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (N - 1)))
-  );
-
-  const mag = fftMagnitude(windowed);
-  if (!mag) return null;
-
-  const freqs = mag.map((_, i) => (i * sampleRateHz) / N);
-  return { freqs, mag };
-}
-
-function detectPeaks(freqs, mag) {
-  const peaks = [];
-  for (let i = 1; i < mag.length - 1; i++) {
-    if (mag[i] > mag[i - 1] && mag[i] > mag[i + 1] && mag[i] > 5) {
-      peaks.push({ freq: freqs[i], amp: mag[i] });
-    }
-  }
-  return peaks.sort((a, b) => b.amp - a.amp).slice(0, 3);
-}
-
-/* ====================== NOTCH FILTER LOGIC ====================== */
-
-function buildNotchRecommendation(peaks) {
-  if (!peaks.length) return null;
-
-  const main = peaks[0];
-  const center = Math.round(main.freq);
-  const bandwidth = Math.round(Math.max(20, center * 0.4)); // ~±20–40%
-  const harmonics = center < 150 ? 2 : 1;
-
-  return {
-    center_hz: center,
-    bandwidth_hz: bandwidth,
-    attenuation_db: 40,
-    harmonics,
-    text: `Strong vibration at ~${center} Hz suggests motor/prop resonance. 
-Enable harmonic notch centered at ${center} Hz with ~${bandwidth} Hz bandwidth.`,
-  };
-}
-
 /* ====================== ANALYSIS ====================== */
 
 function analyzeCSV(file) {
   if (!file) return null;
+
   const { rows, cols } = file;
   const out = {};
 
   AXES.forEach((a, i) => {
+    if (!cols.gyro[i] || !cols.set[i]) return;
+
     const gy = rows.map((r) => r[cols.gyro[i]]).filter(isNum);
     const sp = rows.map((r) => r[cols.set[i]]).filter(isNum);
+
     if (!gy.length || !sp.length) return;
 
     const m = stepResponseMetrics(sp, gy);
+    if (!m) return;
+
     m.noise_rms = rms(gy.filter((_, i) => Math.abs(sp[i] ?? 0) < 5));
     m.score = computeTuneScore(m);
-
-    const fft = computeFFT(gy);
-    if (fft) {
-      const peaks = detectPeaks(fft.freqs, fft.mag);
-      m.fft = fft;
-      m.peaks = peaks;
-      m.notch = buildNotchRecommendation(peaks);
-    }
-
     m.gyro = gy;
     m.set = sp;
+
     out[a.key] = m;
   });
 
@@ -216,18 +145,23 @@ function analyzeCSV(file) {
 /* ====================== APP ====================== */
 
 export default function App() {
-  const [candidate, setCandidate] = useState(null);
+  const [file, setFile] = useState(null);
   const [axis, setAxis] = useState("roll");
 
   function loadFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
+
     const r = new FileReader();
     r.onload = () => {
-      const lines = String(r.result).split(/\r?\n/).filter(Boolean);
-      const headers = lines[0].split(",");
+      const text = String(r.result);
+      const lines = text.split(/\r?\n/).filter((l) => l.trim().length);
+
+      const delimiter = detectDelimiter(lines[0]);
+      const headers = lines[0].split(delimiter);
+
       const rows = lines.slice(1).map((l) => {
-        const v = l.split(",");
+        const v = l.split(delimiter);
         const o = {};
         headers.forEach((h, i) => {
           const n = Number(v[i]);
@@ -235,62 +169,83 @@ export default function App() {
         });
         return o;
       });
-      setCandidate({ rows, headers, cols: guessColumns(headers), name: f.name });
+
+      setFile({
+        name: f.name,
+        headers,
+        cols: guessColumns(headers),
+        rows,
+      });
     };
     r.readAsText(f);
   }
 
-  const data = useMemo(() => analyzeCSV(candidate), [candidate]);
+  const data = useMemo(() => analyzeCSV(file), [file]);
 
   return (
     <div className="app">
-      <h1>PID Analyzer — FFT & Notch Recommendations</h1>
+      <h1>PID Analyzer — Debug‑Safe Version</h1>
 
-      <input type="file" onChange={loadFile} />
-      {candidate?.name}
+      <input type="file" accept=".csv,.txt" onChange={loadFile} />
 
-      {data && (
-        <div style={{ marginTop: 20 }}>
-          Axis:&nbsp;
-          {AXES.map((a) => (
-            <button key={a.key} onClick={() => setAxis(a.key)}>
-              {a.label}
-            </button>
-          ))}
+      {file && (
+        <div style={{ marginTop: 10, fontSize: 13 }}>
+          <b>Loaded:</b> {file.name}
+          <pre>
+Detected gyro columns: {JSON.stringify(file.cols.gyro)}
+Detected setpoint columns: {JSON.stringify(file.cols.set)}
+          </pre>
         </div>
       )}
 
-      {data && data[axis] && (
-        <>
-          <Plot
-            data={[
-              {
-                x: data[axis].fft.freqs,
-                y: data[axis].fft.mag,
-                type: "scatter",
-                mode: "lines",
-              },
-            ]}
-            layout={{
-              title: `FFT Spectrum — ${axis.toUpperCase()}`,
-              xaxis: { title: "Frequency (Hz)", range: [0, 300] },
-              yaxis: { title: "Magnitude" },
-              height: 300,
-            }}
-            style={{ width: "100%" }}
-          />
+      {!data && file && (
+        <div style={{ color: "red", marginTop: 15 }}>
+          ⚠ File loaded, but no usable gyro/setpoint columns were found.<br />
+          This usually means the log is NOT CSV‑formatted (e.g. ArduPilot TXT).
+        </div>
+      )}
 
-          {data[axis].notch && (
-            <div style={{ marginTop: 10 }}>
-              <h3>Notch Filter Recommendation</h3>
-              <ul>
-                <li><b>Center Frequency:</b> {data[axis].notch.center_hz} Hz</li>
-                <li><b>Bandwidth:</b> {data[axis].notch.bandwidth_hz} Hz</li>
-                <li><b>Attenuation:</b> {data[axis].notch.attenuation_db} dB</li>
-                <li><b>Harmonics:</b> {data[axis].notch.harmonics}</li>
-              </ul>
-              <p>{data[axis].notch.text}</p>
+      {data && (
+        <>
+          <div style={{ marginTop: 20 }}>
+            Axis:&nbsp;
+            {AXES.map((a) => (
+              <button
+                key={a.key}
+                onClick={() => setAxis(a.key)}
+                style={{ marginRight: 6 }}
+              >
+                {a.label}
+              </button>
+            ))}
+          </div>
+
+          {!data[axis] && (
+            <div style={{ color: "orange", marginTop: 10 }}>
+              No data available for {axis.toUpperCase()} axis in this log.
             </div>
+          )}
+
+          {data[axis] && (
+            <>
+              <h3>
+                {axis.toUpperCase()} — Score: {data[axis].score}/100
+              </h3>
+
+              <Plot
+                data={[
+                  { y: data[axis].gyro, name: "Gyro", type: "scattergl" },
+                  {
+                    y: data[axis].set,
+                    name: "Setpoint",
+                    type: "scattergl",
+                    line: { dash: "dash" },
+                  },
+                ]}
+                layout={{ height: 400 }}
+                style={{ width: "100%" }}
+              />
+            </>
           )}
         </>
       )}
