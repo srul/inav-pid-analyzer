@@ -3,17 +3,29 @@ import { useState, useEffect } from "react";
 /* ================= CONFIG ================= */
 const AXES = ["roll", "pitch", "yaw"];
 const SEVERITY_ORDER = { OK: 0, WARNING: 1, CRITICAL: 2 };
+const PRESET_KEY = "pid-analyzer-presets";
 
-/* ================= URL ENCODE / DECODE ================= */
+/* ================= STORAGE HELPERS ================= */
+function loadPresets() {
+  try {
+    return JSON.parse(localStorage.getItem(PRESET_KEY)) || [];
+  } catch {
+    return [];
+  }
+}
+
+function savePresets(presets) {
+  localStorage.setItem(PRESET_KEY, JSON.stringify(presets));
+}
+
+/* ================= URL HELPERS (STEP 18) ================= */
 function encodeReport(report) {
-  const json = JSON.stringify(report);
-  return btoa(encodeURIComponent(json));
+  return btoa(encodeURIComponent(JSON.stringify(report)));
 }
 
 function decodeReport(hash) {
   try {
-    const json = decodeURIComponent(atob(hash));
-    return JSON.parse(json);
+    return JSON.parse(decodeURIComponent(atob(hash)));
   } catch {
     return null;
   }
@@ -31,8 +43,7 @@ function parseCSV(file, onSuccess, onError) {
         ? "\t"
         : ",";
       const headers = lines[0].split(delim);
-
-      const idx = name => headers.indexOf(name);
+      const idx = h => headers.indexOf(h);
       const t = idx("time");
 
       const data = lines.slice(1).map(l => {
@@ -82,24 +93,26 @@ function analyze(data) {
 
     axes[a] = {
       severity,
-      overshoot: overshoot.toFixed(1)
+      overshoot: overshoot.toFixed(1),
     };
   });
 
   return {
     generatedAt: new Date().toISOString(),
     global,
-    axes
+    axes,
   };
 }
 
-/* ================= UI ================= */
+/* ================= APP ================= */
 export default function App() {
   const [data, setData] = useState(null);
   const [report, setReport] = useState(null);
+  const [presets, setPresets] = useState(loadPresets());
+  const [presetName, setPresetName] = useState("");
   const [error, setError] = useState("");
 
-  // ✅ Restore from URL hash
+  /* Restore from URL (Step 18) */
   useEffect(() => {
     if (window.location.hash.length > 1) {
       const decoded = decodeReport(window.location.hash.slice(1));
@@ -107,16 +120,42 @@ export default function App() {
     }
   }, []);
 
-  // ✅ Update URL when report changes
+  /* Update URL when report changes */
   useEffect(() => {
     if (report) {
       window.location.hash = encodeReport(report);
     }
   }, [report]);
 
+  /* Save preset */
+  function savePreset() {
+    if (!presetName || !report) return;
+    const next = [
+      ...presets,
+      {
+        id: Date.now(),
+        name: presetName,
+        report,
+      },
+    ];
+    setPresets(next);
+    savePresets(next);
+    setPresetName("");
+  }
+
+  function loadPreset(p) {
+    setReport(p.report);
+  }
+
+  function deletePreset(id) {
+    const next = presets.filter(p => p.id !== id);
+    setPresets(next);
+    savePresets(next);
+  }
+
   return (
-    <div style={{ padding: 20, maxWidth: 800, margin: "auto" }}>
-      <h1>PID Analyzer — Step 18 (Shareable Reports)</h1>
+    <div style={{ padding: 20, maxWidth: 860, margin: "auto" }}>
+      <h1>PID Analyzer — Step 19 (Presets)</h1>
 
       <input
         type="file"
@@ -125,9 +164,8 @@ export default function App() {
           parseCSV(
             e.target.files[0],
             d => {
-              const r = analyze(d);
-              setReport(r);
               setData(d);
+              setReport(analyze(d));
             },
             setError
           )
@@ -173,11 +211,45 @@ export default function App() {
             </tbody>
           </table>
 
-          <p style={{ marginTop: 12 }}>
-            🔗 This report is now encoded in the URL.  
-            Copy & share the link to share this analysis.
-          </p>
+          {/* Save preset */}
+          <div style={{ marginTop: 12 }}>
+            <input
+              placeholder="Preset name (e.g. Roll tune v2)"
+              value={presetName}
+              onChange={e => setPresetName(e.target.value)}
+            />
+            <button onClick={savePreset} style={{ marginLeft: 8 }}>
+              Save Preset
+            </button>
+          </div>
         </>
+      )}
+
+      {/* Presets */}
+      {presets.length > 0 && (
+        <>
+          <h3 style={{ marginTop: 20 }}>Saved Presets</h3>
+          <ul>
+            {presets.map(p => (
+              <li key={p.id}>
+                <b>{p.name}</b>{" "}
+                <button onClick={() => loadPreset(p)}>Load</button>
+                <button
+                  onClick={() => deletePreset(p.id)}
+                  style={{ marginLeft: 6 }}
+                >
+                  Delete
+                </button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+
+      {report && (
+        <p style={{ marginTop: 12 }}>
+          🔗 This report is encoded in the URL — copy the link to share it.
+        </p>
       )}
     </div>
   );
