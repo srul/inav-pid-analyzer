@@ -20,7 +20,7 @@ export default function App() {
         const lines = text.split(/\r?\n/).filter(l => l.trim().length);
         if (lines.length === 0) throw new Error("File is empty");
 
-        // detect delimiter
+        // Detect delimiter
         let delimiter = ",";
         if (lines[0].includes("\t")) delimiter = "\t";
         else if (lines[0].includes(";")) delimiter = ";";
@@ -29,8 +29,13 @@ export default function App() {
 
         const timeIdx = headers.indexOf("time");
         const gyroIdx = headers.indexOf("gyro[0]");
-        if (timeIdx === -1 || gyroIdx === -1) {
-          throw new Error(`Missing required columns. Found: ${headers.join(", ")}`);
+        const setIdx  = headers.indexOf("setpoint[0]");
+
+        if (timeIdx === -1 || gyroIdx === -1 || setIdx === -1) {
+          throw new Error(
+            `Missing required columns.
+Found headers: ${headers.join(", ")}`
+          );
         }
 
         const parsed = lines.slice(1)
@@ -38,13 +43,18 @@ export default function App() {
             const parts = line.split(delimiter);
             return {
               time: Number(parts[timeIdx]),
-              gyro: Number(parts[gyroIdx])
+              gyro: Number(parts[gyroIdx]),
+              setpoint: Number(parts[setIdx]),
             };
           })
-          .filter(r => Number.isFinite(r.time) && Number.isFinite(r.gyro));
+          .filter(r =>
+            Number.isFinite(r.time) &&
+            Number.isFinite(r.gyro) &&
+            Number.isFinite(r.setpoint)
+          );
 
         if (parsed.length === 0) {
-          throw new Error("No numeric rows found");
+          throw new Error("No numeric data rows found");
         }
 
         setInfo({
@@ -60,56 +70,77 @@ export default function App() {
     reader.readAsText(file);
   }
 
-  // SVG helpers
-  function makePath(data, w, h, pad) {
-    const xs = data.map(d => d.time);
-    const ys = data.map(d => d.gyro);
-
-    const minX = Math.min(...xs);
-    const maxX = Math.max(...xs);
-    const minY = Math.min(...ys);
-    const maxY = Math.max(...ys);
+  // SVG path helper (shared scale for gyro + setpoint)
+  function makePath(data, key, w, h, pad, minY, maxY) {
+    const minX = data[0].time;
+    const maxX = data[data.length - 1].time;
 
     return data.map((d, i) => {
-      const x = pad + ((d.time - minX) / (maxX - minX)) * (w - 2 * pad);
-      const y = h - pad - ((d.gyro - minY) / (maxY - minY)) * (h - 2 * pad);
+      const x =
+        pad + ((d.time - minX) / (maxX - minX)) * (w - 2 * pad);
+      const y =
+        h - pad - ((d[key] - minY) / (maxY - minY)) * (h - 2 * pad);
       return `${i === 0 ? "M" : "L"} ${x} ${y}`;
     }).join(" ");
   }
 
   return (
     <div style={{ padding: 20 }}>
-      <h1>PID Analyzer — Step 3 (First Plot)</h1>
+      <h1>PID Analyzer — Step 4 (Gyro + Setpoint)</h1>
 
       <input type="file" accept=".csv,.txt" onChange={loadFile} />
 
-      {error && <div style={{ color: "red", marginTop: 10 }}>❌ {error}</div>}
+      {error && (
+        <div style={{ color: "red", marginTop: 10 }}>
+          ❌ {error}
+        </div>
+      )}
 
       {info && (
         <div style={{ marginTop: 10 }}>
-          <b>File:</b> {info.name} <br />
+          <b>File:</b> {info.name}<br />
           <b>Rows:</b> {info.rows}
         </div>
       )}
 
-      {rows.length > 0 && (
-        <svg
-          width={800}
-          height={300}
-          style={{
-            marginTop: 20,
-            border: "1px solid #ccc",
-            background: "#fafafa"
-          }}
-        >
-          <path
-            d={makePath(rows, 800, 300, 30)}
-            fill="none"
-            stroke="#0070f3"
-            strokeWidth="2"
-          />
-        </svg>
-      )}
+      {rows.length > 0 && (() => {
+        const w = 800;
+        const h = 300;
+        const pad = 30;
+
+        const ys = rows.flatMap(r => [r.gyro, r.setpoint]);
+        const minY = Math.min(...ys);
+        const maxY = Math.max(...ys);
+
+        return (
+          <svg
+            width={w}
+            height={h}
+            style={{
+              marginTop: 20,
+              border: "1px solid #ccc",
+              background: "#fafafa",
+            }}
+          >
+            {/* Setpoint */}
+            <path
+              d={makePath(rows, "setpoint", w, h, pad, minY, maxY)}
+              fill="none"
+              stroke="red"
+              strokeWidth="2"
+              strokeDasharray="6 4"
+            />
+
+            {/* Gyro */}
+            <path
+              d={makePath(rows, "gyro", w, h, pad, minY, maxY)}
+              fill="none"
+              stroke="#0070f3"
+              strokeWidth="2"
+            />
+          </svg>
+        );
+      })()}
     </div>
   );
 }
