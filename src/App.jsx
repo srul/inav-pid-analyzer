@@ -1,7 +1,6 @@
 import { useMemo, useState, lazy, Suspense } from "react";
 import "./App.css";
 
-// Lazy-load Plotly chunk
 const Plot = lazy(() => import("react-plotly.js"));
 
 /* ---------------- constants ---------------- */
@@ -131,7 +130,7 @@ function median(arr) {
   return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
 }
 
-// iNav blackbox often logs time in microseconds; detect & convert to seconds for ms metrics [1](https://github.com/iNavFlight/inav/blob/master/docs/Blackbox.md)
+// iNav Blackbox often logs time in microseconds [5](https://github.com/iNavFlight/inav/blob/master/docs/Blackbox.md)
 function inferTimeScaleToSeconds(t) {
   const tt = t.filter(isFiniteNum);
   if (tt.length < 5) return { tSec: null, dtSec: null, unitLabel: "samples" };
@@ -142,6 +141,7 @@ function inferTimeScaleToSeconds(t) {
     if (dt > 0 && Number.isFinite(dt)) dts.push(dt);
   }
   const dtMed = median(dts);
+
   let scale = 1;
   let unitLabel = "s";
 
@@ -166,11 +166,7 @@ function rms(arr) {
 }
 
 /**
- * Step-response metrics:
- * - rise time 10→90%
- * - settling time within ±5%
- * - percent overshoot
- * These are standard step-response definitions. [2](https://pressbooks.library.torontomu.ca/controlsystems/chapter/4-3-step-response-specifications-definitions/)
+ * Step-response metrics (standard definitions: overshoot, settling time, rise time). [1](https://pressbooks.library.torontomu.ca/controlsystems/chapter/4-3-step-response-specifications-definitions/)
  */
 function stepResponseMetrics(tSec, sp, gy, dtSec) {
   const n = Math.min(sp.length, gy.length, tSec.length);
@@ -336,32 +332,90 @@ function trackingDelayMs(tSec, sp, gy, dtSec) {
   return bestLag * dtSec * 1000;
 }
 
-/* ---------------- warnings ---------------- */
+/* ---------------- warnings + recommendations ---------------- */
 
 function generateWarnings(m) {
   const warnings = [];
 
   if (m.overshoot_pct != null && m.overshoot_pct >= 20) {
-    warnings.push({ level: "error", text: `High overshoot (${m.overshoot_pct.toFixed(1)}%) → P too high` });
+    warnings.push({ level: "error", code: "P_HIGH", text: `High overshoot (${m.overshoot_pct.toFixed(1)}%) → P too high` });
   }
 
   if (m.settle_ms != null && m.overshoot_pct != null && m.overshoot_pct > 5 && m.settle_ms > 350) {
-    warnings.push({ level: "warn", text: `Slow settling (${m.settle_ms.toFixed(0)} ms) → D too low` });
+    warnings.push({ level: "warn", code: "D_LOW", text: `Slow settling (${m.settle_ms.toFixed(0)} ms) → D too low` });
   }
 
   if (m.noise_rms != null && m.noise_rms > 15) {
-    warnings.push({ level: "warn", text: `High noise (RMS ${m.noise_rms.toFixed(1)}) → D too high or filtering/motors` });
+    warnings.push({ level: "warn", code: "D_NOISE", text: `High noise (RMS ${m.noise_rms.toFixed(1)}) → D too high or filtering/motors` });
   }
 
   if (m.sse != null && Math.abs(m.sse) > 2) {
-    warnings.push({ level: "info", text: `Steady‑state error (${m.sse.toFixed(2)}) → possible I accumulation` });
+    warnings.push({ level: "info", code: "I_WINDUP", text: `Steady‑state error (${m.sse.toFixed(2)}) → possible I accumulation` });
   }
 
   if (m.lag_ms != null && Math.abs(m.lag_ms) > 40) {
-    warnings.push({ level: "info", text: `Tracking delay (${m.lag_ms.toFixed(1)} ms) → latency / filtering` });
+    warnings.push({ level: "info", code: "LATENCY", text: `Tracking delay (${m.lag_ms.toFixed(1)} ms) → latency / filtering` });
   }
 
   return warnings;
+}
+
+/**
+ * Recommendations are conservative multipliers.
+ * They reflect standard PID behavior: P can cause overshoot/oscillation if too high,
+ * D damps overshoot but can amplify noise, I removes steady-state error but can wind up. [2](https://deepwiki.com/iNavFlight/inav-configurator/4.2-pid-tuning-and-receiver-configuration)[3](https://chemicalengineeringsite.in/pid-controller-functioning-and-tuning-methods/)[4](https://pidexplained.com/how-to-tune-a-pid-controller/)
+ */
+function generateRecommendations(m, warnings) {
+  // Multipliers start at 1.0 (no change)
+  let p = 1.0, i = 1.0, d = 1.0, ff = 1.0;
+  const reasons = [];
+
+  const has = (code) => warnings.some(w => w.code === code);
+
+  if (has("P_HIGH")) {
+    // overshoot => reduce P a bit
+    p *= 0.90;
+    reasons.push("Reduce P ~10% to lower overshoot.");
+  }
+
+  if (has("D_LOW")) {
+    // slow settling => increase D a bit
+    d *= 1.10;
+    reasons.push("Increase D ~10% to improve damping / settling.");
+  }
+
+  if (has("D_NOISE")) {
+    // noise => reduce D slightly; suggest filtering
+    d *= 0.90;
+    reasons.push("Reduce D ~10% (and consider more filtering / mechanical noise sources).");
+  }
+
+  if (has("I_WINDUP")) {
+    // persistent SSE => small I increase or decrease depends on sign? We keep conservative:
+    // If SSE magnitude is high and settle is slow, avoid increasing I too much.
+    if (m.settle_ms != null && m.settle_ms > 350) {
+      i *= 0.95;
+      reasons.push("SSE + slow settle: slightly reduce I (~5%) to avoid windup/oscillation.");
+    } else {
+      i *= 1.05;
+      reasons.push("SSE present: slightly increase I (~5%) to reduce steady-state error.");
+    }
+  }
+
+  if (has("LATENCY")) {
+    // latency usually not solved by PID alone; recommend small FF increase (if used)
+    ff *= 1.05;
+    reasons.push("Latency detected: small FF increase (~5%) may improve stick tracking (also review filtering).");
+  }
+
+  // Clamp to sane bounds
+  const clamp = (x) => Math.min(1.25, Math.max(0.75, x));
+  p = clamp(p); i = clamp(i); d = clamp(d); ff = clamp(ff);
+
+  // If no warnings, return empty recs
+  if (!reasons.length) return { p: 1, i: 1, d: 1, ff: 1, reasons: ["No changes suggested (metrics look OK)."] };
+
+  return { p, i, d, ff, reasons };
 }
 
 /* ---------------- component ---------------- */
@@ -546,21 +600,26 @@ export default function App() {
     return out;
   }, [fileInfo, timeCol, gyroCols, setpointCols, maxPoints]);
 
-  const warningsByAxis = useMemo(() => {
-    const w = {};
-    if (!metricsByAxis) return w;
+  const warningsAndRecsByAxis = useMemo(() => {
+    const out = {};
+    if (!metricsByAxis) return out;
+
     AXES.forEach((a) => {
       const m = metricsByAxis.axes?.[a.key];
-      if (m) w[a.key] = generateWarnings(m);
+      if (!m) return;
+      const ws = generateWarnings(m);
+      const rec = generateRecommendations(m, ws);
+      out[a.key] = { m, ws, rec };
     });
-    return w;
+
+    return out;
   }, [metricsByAxis]);
 
   return (
     <div className="app">
       <header className="header">
         <h1>iNav PID Analyzer</h1>
-        <p>Gyro vs Setpoint + PID overlays + metrics + warnings</p>
+        <p>Warnings + Recommendations (rule-based)</p>
       </header>
 
       <main className="main">
@@ -622,57 +681,7 @@ export default function App() {
 
           {fileInfo && (
             <div style={{ width: "100%" }}>
-              <h3>Manual override (if auto-detect misses)</h3>
-
-              <div style={{ marginBottom: 12 }}>
-                <label>
-                  Time:&nbsp;
-                  <select value={timeCol} onChange={(e) => setTimeCol(e.target.value)}>
-                    <option value="">-- select --</option>
-                    {fileInfo.headers.map((h) => (
-                      <option key={h} value={h}>{h}</option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-
-              <div style={{ marginBottom: 12 }}>
-                <label>
-                  Gyro cols (choose 3 in order Roll/Pitch/Yaw):<br />
-                  <select
-                    multiple
-                    style={{ width: "100%", height: 120 }}
-                    value={gyroCols}
-                    onChange={(e) => setGyroCols(Array.from(e.target.selectedOptions).map((o) => o.value))}
-                  >
-                    {fileInfo.headers.map((h) => (
-                      <option key={h} value={h}>{h}</option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-
-              <div style={{ marginBottom: 12 }}>
-                <label>
-                  Setpoint cols (choose 3 in order Roll/Pitch/Yaw):<br />
-                  <select
-                    multiple
-                    style={{ width: "100%", height: 120 }}
-                    value={setpointCols}
-                    onChange={(e) => setSetpointCols(Array.from(e.target.selectedOptions).map((o) => o.value))}
-                  >
-                    {fileInfo.headers.map((h) => (
-                      <option key={h} value={h}>{h}</option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-
-              <div style={{ marginBottom: 18 }}>
-                <label>
-                  PID cols are auto-detected (P/I/D/FF arrays or *_roll/pitch/yaw). If missing, no overlay is shown.
-                </label>
-              </div>
+              <h3>Plot</h3>
 
               {canPlot && (
                 <Suspense fallback={<p>Loading chart…</p>}>
@@ -691,59 +700,77 @@ export default function App() {
                 </Suspense>
               )}
 
-              {metricsByAxis && (
-                <div style={{ marginTop: 16, fontSize: 14 }}>
-                  <h3>Metrics + Warnings</h3>
+              <h3 style={{ marginTop: 18 }}>Metrics → Warnings → Recommendations</h3>
+              <p style={{ marginTop: 0, color: "#6b7280" }}>
+                P affects responsiveness/overshoot, I removes steady-state error, D damps overshoot but can amplify noise, FF improves stick response. [2](https://deepwiki.com/iNavFlight/inav-configurator/4.2-pid-tuning-and-receiver-configuration)[3](https://chemicalengineeringsite.in/pid-controller-functioning-and-tuning-methods/)[4](https://pidexplained.com/how-to-tune-a-pid-controller/)
+              </p>
 
-                  {AXES.map((a) => {
-                    const m = metricsByAxis.axes?.[a.key];
-                    const ws = warningsByAxis[a.key] || [];
+              {AXES.map((a) => {
+                const pack = warningsAndRecsByAxis[a.key];
+                if (!pack) {
+                  return (
+                    <div key={a.key} style={{ marginBottom: 14 }}>
+                      <strong style={{ color: a.color }}>{a.label}</strong>: (missing metrics — select gyro+setpoint)
+                    </div>
+                  );
+                }
 
-                    return (
-                      <div key={a.key} style={{ marginBottom: 14 }}>
-                        <strong style={{ color: a.color }}>{a.label}</strong>{" "}
-                        {m ? (
-                          <>
-                            — Steps: {m.steps} | Lag: {m.lag_ms?.toFixed?.(1) ?? "n/a"} ms | Noise RMS: {m.noise_rms.toFixed(2)}
-                            <br />
-                            Rise: {m.rise_ms ? `${m.rise_ms.toFixed(1)} ms` : "n/a"} | Settle: {m.settle_ms ? `${m.settle_ms.toFixed(1)} ms` : "n/a"} | Overshoot: {m.overshoot_pct ? `${m.overshoot_pct.toFixed(1)}%` : "n/a"} | SSE: {m.sse ? m.sse.toFixed(2) : "n/a"}
-                          </>
-                        ) : (
-                          <span style={{ color: "#6b7280" }}>— missing gyro/setpoint for this axis</span>
-                        )}
+                const { m, ws, rec } = pack;
 
-                        {m && (
-                          <>
-                            {ws.length > 0 ? (
-                              <ul style={{ marginTop: 6, marginBottom: 0 }}>
-                                {ws.map((w, i) => (
-                                  <li
-                                    key={i}
-                                    style={{
-                                      color:
-                                        w.level === "error"
-                                          ? "#dc2626"
-                                          : w.level === "warn"
-                                          ? "#f59e0b"
-                                          : "#2563eb",
-                                    }}
-                                  >
-                                    {w.text}
-                                  </li>
-                                ))}
-                              </ul>
-                            ) : (
-                              <div style={{ color: "#16a34a", marginTop: 6 }}>
-                                ✅ No issues detected
-                              </div>
-                            )}
-                          </>
-                        )}
+                const pct = (mult) => `${mult >= 1 ? "+" : ""}${((mult - 1) * 100).toFixed(0)}%`;
+
+                return (
+                  <div key={a.key} style={{ marginBottom: 16 }}>
+                    <strong style={{ color: a.color }}>{a.label}</strong>{" "}
+                    <span style={{ color: "#6b7280" }}>
+                      (steps={m.steps}, overshoot={m.overshoot_pct?.toFixed?.(1) ?? "n/a"}%, settle={m.settle_ms?.toFixed?.(0) ?? "n/a"} ms, noise={m.noise_rms?.toFixed?.(2)})
+                    </span>
+
+                    {/* Warnings */}
+                    {ws.length > 0 ? (
+                      <ul style={{ marginTop: 6, marginBottom: 6 }}>
+                        {ws.map((w, i) => (
+                          <li
+                            key={i}
+                            style={{
+                              color:
+                                w.level === "error"
+                                  ? "#dc2626"
+                                  : w.level === "warn"
+                                  ? "#f59e0b"
+                                  : "#2563eb",
+                            }}
+                          >
+                            {w.text}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div style={{ color: "#16a34a", marginTop: 6 }}>
+                        ✅ No issues detected
                       </div>
-                    );
-                  })}
-                </div>
-              )}
+                    )}
+
+                    {/* Recommendations */}
+                    <div style={{ marginTop: 6 }}>
+                      <strong>Suggested changes (conservative):</strong>{" "}
+                      <span style={{ color: "#374151" }}>
+                        P {pct(rec.p)} · I {pct(rec.i)} · D {pct(rec.d)} · FF {pct(rec.ff)}
+                      </span>
+                      <ul style={{ marginTop: 6, marginBottom: 0 }}>
+                        {rec.reasons.map((t, i) => (
+                          <li key={i} style={{ color: "#374151" }}>
+                            {t}
+                          </li>
+                        ))}
+                      </ul>
+                      <div style={{ marginTop: 6, fontSize: 12, color: "#6b7280" }}>
+                        Tip: Apply small changes one axis at a time; D reduces overshoot but can amplify noise, I can wind up. [3](https://chemicalengineeringsite.in/pid-controller-functioning-and-tuning-methods/)[2](https://deepwiki.com/iNavFlight/inav-configurator/4.2-pid-tuning-and-receiver-configuration)
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
         </section>
