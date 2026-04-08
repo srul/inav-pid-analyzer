@@ -112,14 +112,17 @@ function computeScore(m) {
 /* ====================== ANALYSIS ====================== */
 
 function analyzeCSV(file) {
+  console.log("COLUMNS:", cols);
+  console.log("FIRST ROW:", rows[0]);
   if (!file) return null;
   const { rows, cols } = file;
   const out = {};
 
   AXES.forEach((a, i) => {
+
     // ✅ FIX: explicit null/undefined check (NO truthy/falsy bug)
     if (cols.gyro[i] == null || cols.set[i] == null) return;
-
+    console.log("Testing axis", a.key, "gyro col:", cols.gyro[i], "set col:", cols.set[i]);
     const gy = rows.map((r) => r[cols.gyro[i]]).filter(isNum);
     const sp = rows.map((r) => r[cols.set[i]]).filter(isNum);
     if (!gy.length || !sp.length) return;
@@ -133,6 +136,7 @@ function analyzeCSV(file) {
     m.set = sp;
 
     out[a.key] = m;
+    console.log(a.key, "gyro samples:", gy.slice(0,5), "setpoint samples:", sp.slice(0,5));
   });
 
   return out;
