@@ -1,22 +1,23 @@
 import { useState } from "react";
 
-/* ========== CONFIG ========== */
+/* ================= CONFIG ================= */
 const AXES = [
-  { key: "roll", label: "Roll", gyro: "gyro[0]", set: "setpoint[0]" },
-  { key: "pitch", label: "Pitch", gyro: "gyro[1]", set: "setpoint[1]" },
-  { key: "yaw", label: "Yaw", gyro: "gyro[2]", set: "setpoint[2]" },
+  { key: "roll", label: "Roll", gyro: "gyro[0]" },
+  { key: "pitch", label: "Pitch", gyro: "gyro[1]" },
+  { key: "yaw", label: "Yaw", gyro: "gyro[2]" },
 ];
 
-const FFT_SAMPLES = 512; // power of 2 recommended
+const FFT_SAMPLES = 512;
+const MIN_FREQ = 20; // ignore below 20 Hz
 
-/* ========== HELPERS ========== */
-
+/* ================= CSV PARSER ================= */
 function parseCSV(file, onSuccess, onError) {
   const reader = new FileReader();
   reader.onload = () => {
     try {
       const text = String(reader.result);
       const lines = text.split(/\r?\n/).filter(l => l.trim().length);
+
       let delimiter = ",";
       if (lines[0].includes("\t")) delimiter = "\t";
       else if (lines[0].includes(";")) delimiter = ";";
@@ -25,32 +26,26 @@ function parseCSV(file, onSuccess, onError) {
       const timeIdx = headers.indexOf("time");
 
       const idx = {
-        roll: {
-          gyro: headers.indexOf("gyro[0]"),
-          set: headers.indexOf("setpoint[0]"),
-        },
-        pitch: {
-          gyro: headers.indexOf("gyro[1]"),
-          set: headers.indexOf("setpoint[1]"),
-        },
-        yaw: {
-          gyro: headers.indexOf("gyro[2]"),
-          set: headers.indexOf("setpoint[2]"),
-        },
+        roll: headers.indexOf("gyro[0]"),
+        pitch: headers.indexOf("gyro[1]"),
+        yaw: headers.indexOf("gyro[2]"),
       };
 
-      if (timeIdx < 0 || Object.values(idx).some(a => a.gyro < 0 || a.set < 0))
-        throw new Error("Missing required columns");
+      if (timeIdx < 0 || Object.values(idx).some(i => i < 0)) {
+        throw new Error("Required gyro columns not found");
+      }
 
-      const data = lines.slice(1).map(line => {
-        const p = line.split(delimiter);
-        return {
-          time: Number(p[timeIdx]),
-          roll: { gyro: Number(p[idx.roll.gyro]) },
-          pitch: { gyro: Number(p[idx.pitch.gyro]) },
-          yaw: { gyro: Number(p[idx.yaw.gyro]) },
-        };
-      }).filter(r => Number.isFinite(r.time));
+      const data = lines.slice(1)
+        .map(l => {
+          const p = l.split(delimiter);
+          return {
+            time: Number(p[timeIdx]),
+            roll: Number(p[idx.roll]),
+            pitch: Number(p[idx.pitch]),
+            yaw: Number(p[idx.yaw]),
+          };
+        })
+        .filter(r => Number.isFinite(r.time));
 
       onSuccess(data);
     } catch (e) {
@@ -60,28 +55,45 @@ function parseCSV(file, onSuccess, onError) {
   reader.readAsText(file);
 }
 
-/* ===== FFT (simple DFT, magnitude only) ===== */
-
+/* ================= FFT ================= */
 function computeFFT(signal, sampleRate) {
   const N = signal.length;
-  const result = [];
+  const out = [];
 
   for (let k = 0; k < N / 2; k++) {
-    let real = 0, imag = 0;
+    let re = 0, im = 0;
     for (let n = 0; n < N; n++) {
-      const angle = (2 * Math.PI * k * n) / N;
-      real += signal[n] * Math.cos(angle);
-      imag -= signal[n] * Math.sin(angle);
+      const ang = (2 * Math.PI * k * n) / N;
+      re += signal[n] * Math.cos(ang);
+      im -= signal[n] * Math.sin(ang);
     }
-    const magnitude = Math.sqrt(real * real + imag * imag) / N;
+    const mag = Math.sqrt(re * re + im * im) / N;
     const freq = (k * sampleRate) / N;
-    result.push({ freq, magnitude });
+    out.push({ freq, mag });
   }
-  return result;
+  return out;
 }
 
-/* ========== APP ========== */
+/* ================= NOTCH LOGIC ================= */
+function recommendNotch(fft) {
+  const candidates = fft.filter(p => p.freq > MIN_FREQ);
+  if (candidates.length === 0) return null;
 
+  const peak = candidates.reduce((a, b) => b.mag > a.mag ? b : a);
+  const center = peak.freq;
+  const bandwidth = center * 0.4; // ±20%
+
+  return {
+    centerHz: center,
+    bandwidthHz: bandwidth,
+    note:
+      center < 150
+        ? "Likely motor / prop vibration"
+        : "Likely mechanical or resonance vibration",
+  };
+}
+
+/* ================= APP ================= */
 export default function App() {
   const [data, setData] = useState(null);
   const [axis, setAxis] = useState("roll");
@@ -92,31 +104,29 @@ export default function App() {
     (() => {
       const tail = data.slice(-FFT_SAMPLES);
       if (tail.length < FFT_SAMPLES) return null;
-
       const dt = tail[1].time - tail[0].time;
       const fs = 1 / dt;
-
-      const signal = tail.map(r => r[axis].gyro);
-      return computeFFT(signal, fs);
+      const sig = tail.map(r => r[axis]);
+      return computeFFT(sig, fs);
     })();
+
+  const notch = fft && recommendNotch(fft);
 
   return (
     <div style={{ padding: 20 }}>
-      <h1>PID Analyzer — Step 8 (FFT / Vibration)</h1>
+      <h1>PID Analyzer — Step 9 (Notch Recommendation)</h1>
 
       <input
         type="file"
         accept=".csv"
-        onChange={e =>
-          parseCSV(e.target.files[0], setData, setError)
-        }
+        onChange={e => parseCSV(e.target.files[0], setData, setError)}
       />
 
       {error && <div style={{ color: "red" }}>❌ {error}</div>}
 
       {data && (
         <>
-          <div style={{ marginTop: 12 }}>
+          <div style={{ marginTop: 10 }}>
             Axis:&nbsp;
             {AXES.map(a => (
               <button
@@ -142,8 +152,9 @@ export default function App() {
                 style={{ border: "1px solid #ccc", background: "#fafafa" }}
               >
                 {fft.map((p, i) => {
-                  const x = (p.freq / 500) * 800; // up to 500 Hz displayed
-                  const y = 300 - p.magnitude * 200;
+                  if (p.freq > 500) return null;
+                  const x = (p.freq / 500) * 800;
+                  const y = 300 - p.mag * 200;
                   return (
                     <line
                       key={i}
@@ -151,20 +162,31 @@ export default function App() {
                       x2={x}
                       y1={300}
                       y2={y}
-                      stroke="#444"
+                      stroke={notch && Math.abs(p.freq - notch.centerHz) < 2
+                        ? "red"
+                        : "#444"}
                     />
                   );
                 })}
               </svg>
-
-              <div style={{ marginTop: 10 }}>
-                <b>Dominant frequency:</b>{" "}
-                {fft
-                  .reduce((a, b) => (b.magnitude > a.magnitude ? b : a))
-                  .freq.toFixed(1)}{" "}
-                Hz
-              </div>
             </>
+          )}
+
+          {notch && (
+            <div style={{ marginTop: 20 }}>
+              <h3>Notch Filter Recommendation</h3>
+              <ul>
+                <li><b>Center Frequency:</b> {notch.centerHz.toFixed(1)} Hz</li>
+                <li>
+                  <b>Bandwidth:</b> ±{(notch.bandwidthHz / 2).toFixed(1)} Hz
+                </li>
+                <li><b>Diagnosis:</b> {notch.note}</li>
+              </ul>
+              <div style={{ marginTop: 6, color: "#555" }}>
+                Recommendation is based on dominant vibration peak.
+                Validate mechanically before applying aggressive filtering.
+              </div>
+            </div>
           )}
         </>
       )}
