@@ -2,13 +2,13 @@ import { useState } from "react";
 
 /* ================= CONFIG ================= */
 const AXES = [
-  { key: "roll", label: "Roll", gyro: "gyro[0]" },
-  { key: "pitch", label: "Pitch", gyro: "gyro[1]" },
-  { key: "yaw", label: "Yaw", gyro: "gyro[2]" },
+  { key: "roll", label: "Roll" },
+  { key: "pitch", label: "Pitch" },
+  { key: "yaw", label: "Yaw" },
 ];
 
 const FFT_SAMPLES = 512;
-const MIN_FREQ = 20; // ignore below 20 Hz
+const MIN_VIB_FREQ = 20;
 
 /* ================= CSV PARSER ================= */
 function parseCSV(file, onSuccess, onError) {
@@ -23,29 +23,29 @@ function parseCSV(file, onSuccess, onError) {
       else if (lines[0].includes(";")) delimiter = ";";
 
       const headers = lines[0].split(delimiter).map(h => h.trim());
-      const timeIdx = headers.indexOf("time");
 
+      const timeIdx = headers.indexOf("time");
       const idx = {
         roll: headers.indexOf("gyro[0]"),
         pitch: headers.indexOf("gyro[1]"),
         yaw: headers.indexOf("gyro[2]"),
+        rollSp: headers.indexOf("setpoint[0]"),
+        pitchSp: headers.indexOf("setpoint[1]"),
+        yawSp: headers.indexOf("setpoint[2]"),
       };
 
-      if (timeIdx < 0 || Object.values(idx).some(i => i < 0)) {
-        throw new Error("Required gyro columns not found");
-      }
+      if (timeIdx < 0 || Object.values(idx).some(v => v < 0))
+        throw new Error("Required gyro/setpoint columns missing.");
 
-      const data = lines.slice(1)
-        .map(l => {
-          const p = l.split(delimiter);
-          return {
-            time: Number(p[timeIdx]),
-            roll: Number(p[idx.roll]),
-            pitch: Number(p[idx.pitch]),
-            yaw: Number(p[idx.yaw]),
-          };
-        })
-        .filter(r => Number.isFinite(r.time));
+      const data = lines.slice(1).map(l => {
+        const p = l.split(delimiter);
+        return {
+          time: Number(p[timeIdx]),
+          roll: { gyro: Number(p[idx.roll]), set: Number(p[idx.rollSp]) },
+          pitch: { gyro: Number(p[idx.pitch]), set: Number(p[idx.pitchSp]) },
+          yaw: { gyro: Number(p[idx.yaw]), set: Number(p[idx.yawSp]) },
+        };
+      }).filter(r => Number.isFinite(r.time));
 
       onSuccess(data);
     } catch (e) {
@@ -55,42 +55,122 @@ function parseCSV(file, onSuccess, onError) {
   reader.readAsText(file);
 }
 
+/* ================= METRICS ================= */
+function computeMetrics(data, axis) {
+  const g = data.map(r => r[axis].gyro);
+  const s = data.map(r => r[axis].set);
+  const t = data.map(r => r.time);
+
+  const finalSet = s[s.length - 1];
+  if (!finalSet) return null;
+
+  const peak = Math.max(...g);
+  const overshootPct = ((peak - finalSet) / Math.abs(finalSet)) * 100;
+
+  const tailStart = Math.floor(g.length * 0.9);
+  const sse =
+    g.slice(tailStart)
+      .map((v, i) => v - s[tailStart + i])
+      .reduce((a, b) => a + b, 0) /
+    (g.length - tailStart);
+
+  const band = Math.abs(finalSet) * 0.05;
+  let settlingTime = null;
+  for (let i = 0; i < g.length; i++) {
+    if (
+      Math.abs(g[i] - finalSet) <= band &&
+      g.slice(i).every(v => Math.abs(v - finalSet) <= band)
+    ) {
+      settlingTime = t[i];
+      break;
+    }
+  }
+
+  return { overshootPct, sse, settlingTime };
+}
+
 /* ================= FFT ================= */
-function computeFFT(signal, sampleRate) {
+function computeFFT(signal, fs) {
   const N = signal.length;
   const out = [];
-
   for (let k = 0; k < N / 2; k++) {
     let re = 0, im = 0;
     for (let n = 0; n < N; n++) {
-      const ang = (2 * Math.PI * k * n) / N;
-      re += signal[n] * Math.cos(ang);
-      im -= signal[n] * Math.sin(ang);
+      const a = (2 * Math.PI * k * n) / N;
+      re += signal[n] * Math.cos(a);
+      im -= signal[n] * Math.sin(a);
     }
-    const mag = Math.sqrt(re * re + im * im) / N;
-    const freq = (k * sampleRate) / N;
-    out.push({ freq, mag });
+    out.push({
+      freq: (k * fs) / N,
+      mag: Math.sqrt(re * re + im * im) / N,
+    });
   }
   return out;
 }
 
-/* ================= NOTCH LOGIC ================= */
+/* ================= NOTCH ================= */
 function recommendNotch(fft) {
-  const candidates = fft.filter(p => p.freq > MIN_FREQ);
-  if (candidates.length === 0) return null;
+  const vib = fft.filter(p => p.freq > MIN_VIB_FREQ);
+  if (!vib.length) return null;
 
-  const peak = candidates.reduce((a, b) => b.mag > a.mag ? b : a);
-  const center = peak.freq;
-  const bandwidth = center * 0.4; // ±20%
-
+  const peak = vib.reduce((a, b) => b.mag > a.mag ? b : a);
   return {
-    centerHz: center,
-    bandwidthHz: bandwidth,
-    note:
-      center < 150
-        ? "Likely motor / prop vibration"
-        : "Likely mechanical or resonance vibration",
+    freq: peak.freq,
+    bw: peak.freq * 0.4,
   };
+}
+
+/* ================= PID ADVICE (STEP 10) ================= */
+function derivePidAdvice(metrics, notch) {
+  const advice = [];
+
+  if (notch) {
+    advice.push({
+      term: "Prerequisite",
+      text: `Vibration detected at ~${notch.freq.toFixed(1)} Hz.`,
+      action: "Apply notch filter before changing PID gains.",
+    });
+  }
+
+  if (metrics.overshootPct > 15) {
+    advice.push({
+      term: "P",
+      text: "Overshoot is high → loop is aggressive.",
+      action: "Reduce P slightly (≈ −5% to −10%).",
+    });
+  } else if (metrics.overshootPct < 5 && metrics.settlingTime > 0.3) {
+    advice.push({
+      term: "P",
+      text: "Response is slow with low overshoot.",
+      action: "Increase P slightly to improve response.",
+    });
+  }
+
+  if (Math.abs(metrics.sse) > 0.05) {
+    advice.push({
+      term: "I",
+      text: "Steady‑state error present.",
+      action: "Increase I slowly to remove residual error.",
+    });
+  }
+
+  if (metrics.overshootPct > 10 && notch) {
+    advice.push({
+      term: "D",
+      text: "Overshoot remains after vibration control.",
+      action: "Increase D slightly to improve damping.",
+    });
+  }
+
+  if (!advice.length) {
+    advice.push({
+      term: "Stable",
+      text: "System response looks balanced.",
+      action: "No PID changes recommended.",
+    });
+  }
+
+  return advice;
 }
 
 /* ================= APP ================= */
@@ -99,22 +179,26 @@ export default function App() {
   const [axis, setAxis] = useState("roll");
   const [error, setError] = useState("");
 
+  const metrics = data && computeMetrics(data, axis);
+
   const fft =
     data &&
     (() => {
       const tail = data.slice(-FFT_SAMPLES);
       if (tail.length < FFT_SAMPLES) return null;
       const dt = tail[1].time - tail[0].time;
-      const fs = 1 / dt;
-      const sig = tail.map(r => r[axis]);
-      return computeFFT(sig, fs);
+      return computeFFT(
+        tail.map(r => r[axis].gyro),
+        1 / dt
+      );
     })();
 
   const notch = fft && recommendNotch(fft);
+  const pidAdvice = metrics && derivePidAdvice(metrics, notch);
 
   return (
     <div style={{ padding: 20 }}>
-      <h1>PID Analyzer — Step 9 (Notch Recommendation)</h1>
+      <h1>PID Analyzer — Step 10 (PID Recommendations)</h1>
 
       <input
         type="file"
@@ -142,49 +226,36 @@ export default function App() {
             ))}
           </div>
 
-          {fft && (
-            <>
-              <h3 style={{ marginTop: 20 }}>Frequency Spectrum</h3>
-
-              <svg
-                width={800}
-                height={300}
-                style={{ border: "1px solid #ccc", background: "#fafafa" }}
-              >
-                {fft.map((p, i) => {
-                  if (p.freq > 500) return null;
-                  const x = (p.freq / 500) * 800;
-                  const y = 300 - p.mag * 200;
-                  return (
-                    <line
-                      key={i}
-                      x1={x}
-                      x2={x}
-                      y1={300}
-                      y2={y}
-                      stroke={notch && Math.abs(p.freq - notch.centerHz) < 2
-                        ? "red"
-                        : "#444"}
-                    />
-                  );
-                })}
-              </svg>
-            </>
+          {metrics && (
+            <div style={{ marginTop: 15 }}>
+              <h3>Metrics</h3>
+              <ul>
+                <li>Overshoot: {metrics.overshootPct.toFixed(2)}%</li>
+                <li>SSE: {metrics.sse.toFixed(3)}</li>
+                <li>
+                  Settling Time:{" "}
+                  {metrics.settlingTime
+                    ? metrics.settlingTime.toFixed(3) + " s"
+                    : "Not settled"}
+                </li>
+              </ul>
+            </div>
           )}
 
-          {notch && (
+          {pidAdvice && (
             <div style={{ marginTop: 20 }}>
-              <h3>Notch Filter Recommendation</h3>
+              <h3>PID Tuning Advice</h3>
               <ul>
-                <li><b>Center Frequency:</b> {notch.centerHz.toFixed(1)} Hz</li>
-                <li>
-                  <b>Bandwidth:</b> ±{(notch.bandwidthHz / 2).toFixed(1)} Hz
-                </li>
-                <li><b>Diagnosis:</b> {notch.note}</li>
+                {pidAdvice.map((a, i) => (
+                  <li key={i} style={{ marginBottom: 8 }}>
+                    <b>{a.term}</b>: {a.text}
+                    <br />
+                    👉 {a.action}
+                  </li>
+                ))}
               </ul>
-              <div style={{ marginTop: 6, color: "#555" }}>
-                Recommendation is based on dominant vibration peak.
-                Validate mechanically before applying aggressive filtering.
+              <div style={{ fontSize: 12, color: "#666" }}>
+                Apply changes incrementally and re‑test after each adjustment.
               </div>
             </div>
           )}
