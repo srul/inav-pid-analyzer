@@ -1,189 +1,157 @@
 import { useState } from "react";
-import jsPDF from "jspdf";
 
 /* ================= CONFIG ================= */
-const AXES = [
-  { key: "roll", label: "Roll" },
-  { key: "pitch", label: "Pitch" },
-  { key: "yaw", label: "Yaw" },
-];
+const AXES = ["roll", "pitch", "yaw"];
+const SEVERITY_ORDER = { OK: 0, WARNING: 1, CRITICAL: 2 };
 
-const FIRMWARES = {
-  ArduPilot: {
-    notchEnable: "INS_HNTCH_ENABLE",
-    notchFreq: "INS_HNTCH_FREQ",
-    notchBW: "INS_HNTCH_BW",
-    rateP: "ATC_RAT_RLL_P",
-    rateI: "ATC_RAT_RLL_I",
-  },
-  iNav: {
-    notchEnable: "gyro_notch1_enabled",
-    notchFreq: "gyro_notch1_hz",
-    notchBW: "gyro_notch1_cutoff",
-    rateP: "roll_p",
-    rateI: "roll_i",
-  },
-};
+/* ================= CSV PARSER ================= */
+function parseCSV(file, onSuccess, onError) {
+  const r = new FileReader();
+  r.onload = () => {
+    try {
+      const lines = String(r.result).split(/\r?\n/).filter(Boolean);
+      const delim = lines[0].includes(";") ? ";" :
+                    lines[0].includes("\t") ? "\t" : ",";
+      const headers = lines[0].split(delim);
 
-/* ================= EXPORT HELPERS ================= */
-function downloadJSON(obj, filename) {
-  const blob = new Blob([JSON.stringify(obj, null, 2)], {
-    type: "application/json",
-  });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = filename;
-  a.click();
-}
+      const idx = name => headers.indexOf(name);
+      const t = idx("time");
+      const map = axis => ({
+        gyro: idx(`gyro[${axis}]`),
+        set: idx(`setpoint[${axis}]`)
+      });
 
-function exportPDF(report) {
-  const doc = new jsPDF();
-  let y = 10;
-
-  doc.setFontSize(16);
-  doc.text("PID Tuning Report", 10, y);
-  y += 10;
-
-  doc.setFontSize(11);
-  doc.text(`Firmware: ${report.firmware}`, 10, y); y += 6;
-  doc.text(`Global Severity: ${report.globalSeverity}`, 10, y); y += 8;
-
-  report.entries.forEach(entry => {
-    doc.setFontSize(13);
-    doc.text(`${entry.axis.toUpperCase()} — ${entry.severity}`, 10, y);
-    y += 6;
-
-    doc.setFontSize(10);
-    entry.cards.forEach(c => {
-      doc.text(`• ${c.severity}: ${c.title}`, 12, y);
-      y += 5;
-      if (c.params) {
-        c.params.forEach(p => {
-          doc.text(
-            `   ${p.name}: ${p.value}`,
-            14,
-            y
-          );
-          y += 4;
+      const data = lines.slice(1).map(l => {
+        const p = l.split(delim);
+        const entry = { time: +p[t] };
+        AXES.forEach((a, i) => {
+          entry[a] = {
+            gyro: +p[map(i).gyro],
+            set: +p[map(i).set]
+          };
         });
-      }
-    });
-    y += 6;
-    if (y > 270) {
-      doc.addPage();
-      y = 10;
+        return entry;
+      }).filter(r => !isNaN(r.time));
+
+      onSuccess(data);
+    } catch (e) {
+      onError(e.message);
     }
+  };
+  r.readAsText(file);
+}
+
+/* ================= SIMPLE ANALYSIS ================= */
+function analyze(data) {
+  const result = {};
+  let global = "OK";
+
+  AXES.forEach(a => {
+    const g = data.map(r => r[a].gyro);
+    const s = data.map(r => r[a].set);
+    const finalSet = s.at(-1);
+
+    if (Math.abs(finalSet) < 1e-6) {
+      result[a] = { severity: "OK", note: "Inactive" };
+      return;
+    }
+
+    const peak = Math.max(...g);
+    const overshoot = ((peak - finalSet) / Math.abs(finalSet)) * 100;
+
+    let severity = "OK";
+    if (overshoot > 15) severity = "WARNING";
+    if (overshoot > 30) severity = "CRITICAL";
+
+    if (SEVERITY_ORDER[severity] > SEVERITY_ORDER[global])
+      global = severity;
+
+    result[a] = {
+      severity,
+      overshoot: overshoot.toFixed(1),
+    };
   });
 
-  doc.save("pid-tuning-report.pdf");
+  return { global, axes: result };
 }
 
-/* ================= DEMO DATA (from previous steps) ================= */
-function buildDemoReport(firmware) {
-  return {
-    firmware,
-    globalSeverity: "CRITICAL",
-    generatedAt: new Date().toISOString(),
-    entries: [
-      {
-        axis: "roll",
-        severity: "CRITICAL",
-        cards: [
-          {
-            severity: "CRITICAL",
-            title: "Enable Harmonic Notch Filter",
-            params: [
-              { name: FIRMWARES[firmware].notchEnable, value: "1" },
-              { name: FIRMWARES[firmware].notchFreq, value: "120 Hz" },
-              { name: FIRMWARES[firmware].notchBW, value: "60 Hz" },
-            ],
-          },
-          {
-            severity: "WARNING",
-            title: "High Overshoot",
-            params: [
-              { name: FIRMWARES[firmware].rateP, value: "Reduce 5–10%" },
-            ],
-          },
-        ],
-      },
-      {
-        axis: "pitch",
-        severity: "OK",
-        cards: [
-          {
-            severity: "OK",
-            title: "No Issues Detected",
-          },
-        ],
-      },
-      {
-        axis: "yaw",
-        severity: "OK",
-        cards: [
-          {
-            severity: "OK",
-            title: "No Issues Detected",
-          },
-        ],
-      },
-    ],
-  };
+/* ================= DIFF ================= */
+function diff(before, after) {
+  return AXES.map(a => {
+    const b = before.axes[a].severity;
+    const f = after.axes[a].severity;
+    let status = "No Change";
+
+    if (SEVERITY_ORDER[f] < SEVERITY_ORDER[b]) status = "✅ Improved";
+    if (SEVERITY_ORDER[f] > SEVERITY_ORDER[b]) status = "⚠️ Regressed";
+
+    return {
+      axis: a,
+      before: b,
+      after: f,
+      status
+    };
+  });
 }
 
-/* ================= APP ================= */
+/* ================= UI ================= */
 export default function App() {
-  const [firmware, setFirmware] = useState("ArduPilot");
+  const [baseData, setBaseData] = useState(null);
+  const [candData, setCandData] = useState(null);
+  const [error, setError] = useState("");
 
-  const report = buildDemoReport(firmware);
+  const base = baseData && analyze(baseData);
+  const cand = candData && analyze(candData);
+  const delta = base && cand && diff(base, cand);
 
   return (
-    <div style={{
-      background: "#020617",
-      minHeight: "100vh",
-      color: "#e5e7eb",
-      padding: 20,
-      maxWidth: 720,
-      margin: "0 auto",
-    }}>
-      <h1>PID Analyzer — Step 16 (Export)</h1>
+    <div style={{ padding: 20, maxWidth: 800, margin: "auto" }}>
+      <h1>PID Analyzer — Step 17 (Before / After)</h1>
 
       <label>
-        Firmware:&nbsp;
-        <select
-          value={firmware}
-          onChange={e => setFirmware(e.target.value)}
-        >
-          {Object.keys(FIRMWARES).map(f => (
-            <option key={f}>{f}</option>
-          ))}
-        </select>
+        Baseline log:
+        <input type="file" onChange={e => parseCSV(e.target.files[0], setBaseData, setError)} />
       </label>
 
-      <div style={{ marginTop: 20 }}>
-        <button
-          onClick={() => downloadJSON(report, "pid-tuning-report.json")}
-          style={{ marginRight: 10 }}
-        >
-          Export JSON
-        </button>
+      <br /><br />
 
-        <button onClick={() => exportPDF(report)}>
-          Export PDF
-        </button>
-      </div>
+      <label>
+        Candidate log:
+        <input type="file" onChange={e => parseCSV(e.target.files[0], setCandData, setError)} />
+      </label>
 
-      <pre style={{
-        marginTop: 20,
-        background: "#020617",
-        border: "1px solid #334155",
-        padding: 12,
-        borderRadius: 6,
-        fontSize: 12,
-        overflowX: "auto",
-      }}>
-        {JSON.stringify(report, null, 2)}
-      </pre>
+      {error && <div style={{ color: "red" }}>{error}</div>}
+
+      {delta && (
+        <>
+          <h2>Summary</h2>
+          <p>
+            Baseline: <b>{base.global}</b> → Candidate: <b>{cand.global}</b>
+          </p>
+
+          <h2>Axis Comparison</h2>
+          <table border="1" cellPadding="6">
+            <thead>
+              <tr>
+                <th>Axis</th>
+                <th>Before</th>
+                <th>After</th>
+                <th>Result</th>
+              </tr>
+            </thead>
+            <tbody>
+              {delta.map(d => (
+                <tr key={d.axis}>
+                  <td>{d.axis}</td>
+                  <td>{d.before}</td>
+                  <td>{d.after}</td>
+                  <td>{d.status}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
     </div>
   );
 }
