@@ -16,7 +16,7 @@ function parseCSV(file, onSuccess, onError) {
   reader.onload = () => {
     try {
       const text = String(reader.result);
-      const lines = text.split(/\r?\n/).filter(l => l.trim().length);
+      const lines = text.split(/\r?\n/).filter(l => l.trim());
 
       let delimiter = ",";
       if (lines[0].includes("\t")) delimiter = "\t";
@@ -34,8 +34,9 @@ function parseCSV(file, onSuccess, onError) {
         yawSp: headers.indexOf("setpoint[2]"),
       };
 
-      if (timeIdx < 0 || Object.values(idx).some(v => v < 0))
-        throw new Error("Required gyro/setpoint columns missing.");
+      if (timeIdx < 0 || Object.values(idx).some(v => v < 0)) {
+        throw new Error("Required gyro/setpoint columns missing");
+      }
 
       const data = lines.slice(1).map(l => {
         const p = l.split(delimiter);
@@ -62,7 +63,16 @@ function computeMetrics(data, axis) {
   const t = data.map(r => r.time);
 
   const finalSet = s[s.length - 1];
-  if (!finalSet) return null;
+
+  // ✅ FIX: handle inactive axis explicitly
+  if (Math.abs(finalSet) < 1e-6) {
+    return {
+      overshootPct: 0,
+      sse: 0,
+      settlingTime: null,
+      inactive: true,
+    };
+  }
 
   const peak = Math.max(...g);
   const overshootPct = ((peak - finalSet) / Math.abs(finalSet)) * 100;
@@ -86,7 +96,7 @@ function computeMetrics(data, axis) {
     }
   }
 
-  return { overshootPct, sse, settlingTime };
+  return { overshootPct, sse, settlingTime, inactive: false };
 }
 
 /* ================= FFT ================= */
@@ -112,16 +122,25 @@ function computeFFT(signal, fs) {
 function recommendNotch(fft) {
   const vib = fft.filter(p => p.freq > MIN_VIB_FREQ);
   if (!vib.length) return null;
-
-  const peak = vib.reduce((a, b) => b.mag > a.mag ? b : a);
+  const peak = vib.reduce((a, b) => (b.mag > a.mag ? b : a));
   return {
     freq: peak.freq,
     bw: peak.freq * 0.4,
   };
 }
 
-/* ================= PID ADVICE (STEP 10) ================= */
+/* ================= PID ADVICE ================= */
 function derivePidAdvice(metrics, notch) {
+  // ✅ FIX: inactive axis explanation
+  if (metrics.inactive) {
+    return [{
+      term: "Inactive Axis",
+      text: "No significant setpoint change detected on this axis.",
+      action:
+        "PID tuning advice is not applicable. Analyze Roll axis or log a maneuver for this axis.",
+    }];
+  }
+
   const advice = [];
 
   if (notch) {
@@ -187,10 +206,7 @@ export default function App() {
       const tail = data.slice(-FFT_SAMPLES);
       if (tail.length < FFT_SAMPLES) return null;
       const dt = tail[1].time - tail[0].time;
-      return computeFFT(
-        tail.map(r => r[axis].gyro),
-        1 / dt
-      );
+      return computeFFT(tail.map(r => r[axis].gyro), 1 / dt);
     })();
 
   const notch = fft && recommendNotch(fft);
@@ -226,9 +242,13 @@ export default function App() {
             ))}
           </div>
 
-          {metrics && (
-            <div style={{ marginTop: 15 }}>
-              <h3>Metrics</h3>
+          <div style={{ marginTop: 15 }}>
+            <h3>Metrics</h3>
+            {metrics.inactive ? (
+              <div style={{ color: "#666" }}>
+                No step response detected for this axis.
+              </div>
+            ) : (
               <ul>
                 <li>Overshoot: {metrics.overshootPct.toFixed(2)}%</li>
                 <li>SSE: {metrics.sse.toFixed(3)}</li>
@@ -239,8 +259,8 @@ export default function App() {
                     : "Not settled"}
                 </li>
               </ul>
-            </div>
-          )}
+            )}
+          </div>
 
           {pidAdvice && (
             <div style={{ marginTop: 20 }}>
@@ -264,3 +284,4 @@ export default function App() {
     </div>
   );
 }
+``
