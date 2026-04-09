@@ -7,6 +7,7 @@
 // - FFT logic (Step 23)
 
 import { useEffect, useMemo, useState } from "react";
+import ConfidenceIndicator from "./components/ConfidenceIndicator";
 
 /* ================= CONSTANTS ================= */
 const AXES = ["roll", "pitch", "yaw"];
